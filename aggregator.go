@@ -4,7 +4,9 @@
 //
 // 数据面帧结构（DATA/ACK + 重排缓冲 + 聚合窗口流控）由 #18 落地，
 // 见 stream.go / frame.go / reorder.go；多路径接入（PATH_ATTACH +
-// 对称加路径 + 轮询条带）由 #19 落地，见 path.go；调度器在 #20。
+// 对称加路径 + 轮询条带）由 #19 落地，见 path.go；中继路径按需协调
+// （PATH_REQUEST → reservation → PATH_READY → CONNECT）由 #21 落地，
+// 见 relaypath.go；调度器在 #20。
 package netacc
 
 import (
@@ -111,6 +113,15 @@ type Aggregator struct {
 // New 在 host 上创建 Aggregator 并注册 /netacc/agg/1.0.0 与
 // /netacc/path/1.0.0 两个流处理器。同一 host 上重复 New 会互相
 // 覆盖流处理器，应避免。
+//
+// 传输矩阵（规格书 §3.3，#22）：Aggregator 自身不注册传输——
+// 能拨/能听哪些地址完全取决于 host 建 host 时注册的传输集
+// （AddPath/dialDirect 经 swarm.TransportForDialing 逐地址匹配）。
+// go-libp2p 默认传输集已含全部五种：TCP、QUIC、WebSocket（/ws）、
+// WebTransport、WebRTC-direct；注意配置 PSK 私网时默认退化为
+// 仅 TCP+WebSocket（其余传输不支持 PSK）。自定义传输集时把想要
+// 的传输用 libp2p.Transport(...) 注册进 host 即可，本库无需额外
+// 配置。
 func New(h host.Host, opts ...Option) *Aggregator {
 	a := &Aggregator{
 		host: h,
@@ -220,16 +231,23 @@ func (a *Aggregator) unregister(id [16]byte, st *Stream) {
 // 拨新；要确定性地开第二/三条物理连接只能走 TransportForDialing）。
 // 直拨连接不进 swarm 连接表（无 identify/notifiee/connmgr），
 // 生命周期归本库：随其承载的路径一同关闭。
+//
+// 对 addr 形态无传输偏好（#22）：/tcp、/ws、/tls/sni/.../ws、
+// /quic-v1、/quic-v1/webtransport/certhash/...、
+// /webrtc-direct/certhash/... 均可，TransportForDialing 按完整
+// 协议栈匹配传输（mafmt 要求整地址被模式消费，复合后缀天然
+// 归到最外层传输，QUIC 不会误吞 webtransport 地址）。WT/WebRTC
+// 地址缺 certhash 时 Dial 直接报错——certhash 由对端证书决定
+// 且会轮换，地址过期属预期，调用方喂新地址重试即可。
 func (a *Aggregator) dialDirect(ctx context.Context, p peer.ID, addr ma.Multiaddr) (transport.CapableConn, error) {
 	// 容忍 addr 带 /p2p/<peerID> 后缀：剥掉再匹配传输
+	// （电路地址 <relay>/p2p/<relay>/p2p-circuit/p2p/<dest> 同样只剥
+	// 尾部一段，余下的 /p2p-circuit 地址按 isRelayAddr 命中 circuit
+	// transport——circuit transport 就在 TransportForDialing 覆盖内）
 	if pid, err := peer.IDFromP2PAddr(addr); err == nil && pid != "" {
 		addr, _ = ma.SplitLast(addr)
 	}
-	sw, ok := a.host.Network().(*swarm.Swarm)
-	if !ok {
-		return nil, errors.New("netacc: 底层 Network 不是 *swarm.Swarm，无法直拨")
-	}
-	tpt := sw.TransportForDialing(addr)
+	tpt := a.transportForDialing(addr)
 	if tpt == nil {
 		return nil, fmt.Errorf("netacc: 没有能拨 %s 的传输", addr)
 	}
@@ -244,6 +262,15 @@ func (a *Aggregator) dialDirect(ctx context.Context, p peer.ID, addr ma.Multiadd
 		return nil, fmt.Errorf("netacc: 直拨 %s 的对端 %s 不是目标 peer %s", addr, cc.RemotePeer(), p)
 	}
 	return cc, nil
+}
+
+// transportForDialing 返回能拨 addr 的传输；底层不是 swarm 时为 nil。
+func (a *Aggregator) transportForDialing(addr ma.Multiaddr) transport.Transport {
+	sw, ok := a.host.Network().(*swarm.Swarm)
+	if !ok {
+		return nil
+	}
+	return sw.TransportForDialing(addr)
 }
 
 // OpenStream 向 peer 发起一条聚合流：在已有连接上开 /netacc/agg/1.0.0
@@ -306,6 +333,10 @@ func (s *Stream) attachMinPaths(ctx context.Context, n int) error {
 	if len(addrs) == 0 {
 		return fmt.Errorf("netacc: peerstore 无对端地址，WithMinPaths(%d) 无法补挂路径", n)
 	}
+	// 按 §3.3 传输偏好先排序：TCP/WS 优先于 UDP 系（QUIC/WT/WebRTC
+	// 同生共死，未实测带宽前不应抢占补挂名额）。这只是先验排序，
+	// 实测降权由调度器负责（#20）。
+	SortAddrsByPreference(addrs)
 	for len(s.Paths()) < n {
 		progress := false
 		for _, addr := range addrs {

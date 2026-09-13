@@ -34,8 +34,8 @@ const (
 	frameAck                              // ACK：SACK 式确认 + 窗口通告
 	framePathAttach                       // PATH_ATTACH：新路径绑定 agg_stream_id（#19）
 	framePathDrop                         // PATH_DROP：摘除路径（#19）
-	framePathRequest                      // PATH_REQUEST：请求协调中继路径（#19）
-	framePathReady                        // PATH_READY：中继 reservation 就绪（#19）
+	framePathRequest                      // PATH_REQUEST：请求协调中继路径（#21）
+	framePathReady                        // PATH_READY：中继 reservation 就绪（#21）
 	framePing                             // PING：主动探测（冷启动/疑似降级，#20）
 	frameTelemetry                        // TELEMETRY：收端观测速率回报（#20）
 	frameFin                              // FIN：发送端正常关闭（本票仅做 EOF 语义）

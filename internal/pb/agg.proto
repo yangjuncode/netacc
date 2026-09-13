@@ -44,6 +44,41 @@ message PathDrop {
   uint64 path_id = 1;
 }
 
+// PathRequest 是 PATH_REQUEST 帧（帧类型 5）的 protobuf 帧体：
+// 加路径方在任意存活路径上发出，请求对端配合建立一条经中继的路径
+// （中继路径的按需协调，规格书 §4.3）。帧体即中继路径描述符——
+// 中继 peerID + 中继可达地址集 + 逐跳传输偏好。
+//
+// 逐跳偏好语义：A→C 段（发起方→中继）由 ac_addr 表达——发起方从
+// 地址集挑定、随后体现到 CONNECT 的电路地址里，随帧告知对端便于
+// 观测/调试；C→B 段即对端 reservation 所用传输，由对端自选，
+// 不进帧体。
+message PathRequest {
+  // request_id：发起方在聚合流内单调递增的序号，
+  // 把随后的 PATH_READY 应答关联回本请求。
+  uint64 request_id = 1;
+  // 中继节点 peerID（原始字节）。
+  bytes relay_peer = 2;
+  // 中继可达地址集（multiaddr 字节，允许带 /p2p/<relay> 后缀，
+  // 接收方剥离）。对端用它们连到中继做 reservation；空集时对端
+  // 只能依赖 peerstore 已有信息。
+  repeated bytes relay_addrs = 3;
+  // A→C 段传输偏好：发起方选定的中继地址（multiaddr 字节，
+  // 即随后电路地址内嵌的那条）。信息性字段——对端可忽略。
+  bytes ac_addr = 4;
+}
+
+// PathReady 是 PATH_READY 帧（帧类型 6）的 protobuf 帧体：
+// 对端完成（或失败）向中继的 reservation 后回送。error 为空表示成功，
+// 发起方随后经 <relay-addr>/p2p/<relay>/p2p-circuit/p2p/<对端>
+// 电路地址拨 CONNECT 建中继路径。
+message PathReady {
+  // 回显对应 PATH_REQUEST 的 request_id。
+  uint64 request_id = 1;
+  // 非空 = 对端 reservation 失败原因（错误透传给发起方）。
+  string error = 2;
+}
+
 // Ping 是 PING 帧（帧类型 7）的 protobuf 帧体：逐路径主动探测
 // （规格书 §5.2：仅用于冷启动、est_rate 过期、疑似降级，不常态化）。
 //

@@ -226,6 +226,149 @@ func (x *PathDrop) GetPathId() uint64 {
 	return 0
 }
 
+// PathRequest 是 PATH_REQUEST 帧（帧类型 5）的 protobuf 帧体：
+// 加路径方在任意存活路径上发出，请求对端配合建立一条经中继的路径
+// （中继路径的按需协调，规格书 §4.3）。帧体即中继路径描述符——
+// 中继 peerID + 中继可达地址集 + 逐跳传输偏好。
+//
+// 逐跳偏好语义：A→C 段（发起方→中继）由 ac_addr 表达——发起方从
+// 地址集挑定、随后体现到 CONNECT 的电路地址里，随帧告知对端便于
+// 观测/调试；C→B 段即对端 reservation 所用传输，由对端自选，
+// 不进帧体。
+type PathRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// request_id：发起方在聚合流内单调递增的序号，
+	// 把随后的 PATH_READY 应答关联回本请求。
+	RequestId uint64 `protobuf:"varint,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	// 中继节点 peerID（原始字节）。
+	RelayPeer []byte `protobuf:"bytes,2,opt,name=relay_peer,json=relayPeer,proto3" json:"relay_peer,omitempty"`
+	// 中继可达地址集（multiaddr 字节，允许带 /p2p/<relay> 后缀，
+	// 接收方剥离）。对端用它们连到中继做 reservation；空集时对端
+	// 只能依赖 peerstore 已有信息。
+	RelayAddrs [][]byte `protobuf:"bytes,3,rep,name=relay_addrs,json=relayAddrs,proto3" json:"relay_addrs,omitempty"`
+	// A→C 段传输偏好：发起方选定的中继地址（multiaddr 字节，
+	// 即随后电路地址内嵌的那条）。信息性字段——对端可忽略。
+	AcAddr        []byte `protobuf:"bytes,4,opt,name=ac_addr,json=acAddr,proto3" json:"ac_addr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PathRequest) Reset() {
+	*x = PathRequest{}
+	mi := &file_internal_pb_agg_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PathRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PathRequest) ProtoMessage() {}
+
+func (x *PathRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_pb_agg_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PathRequest.ProtoReflect.Descriptor instead.
+func (*PathRequest) Descriptor() ([]byte, []int) {
+	return file_internal_pb_agg_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *PathRequest) GetRequestId() uint64 {
+	if x != nil {
+		return x.RequestId
+	}
+	return 0
+}
+
+func (x *PathRequest) GetRelayPeer() []byte {
+	if x != nil {
+		return x.RelayPeer
+	}
+	return nil
+}
+
+func (x *PathRequest) GetRelayAddrs() [][]byte {
+	if x != nil {
+		return x.RelayAddrs
+	}
+	return nil
+}
+
+func (x *PathRequest) GetAcAddr() []byte {
+	if x != nil {
+		return x.AcAddr
+	}
+	return nil
+}
+
+// PathReady 是 PATH_READY 帧（帧类型 6）的 protobuf 帧体：
+// 对端完成（或失败）向中继的 reservation 后回送。error 为空表示成功，
+// 发起方随后经 <relay-addr>/p2p/<relay>/p2p-circuit/p2p/<对端>
+// 电路地址拨 CONNECT 建中继路径。
+type PathReady struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 回显对应 PATH_REQUEST 的 request_id。
+	RequestId uint64 `protobuf:"varint,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	// 非空 = 对端 reservation 失败原因（错误透传给发起方）。
+	Error         string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PathReady) Reset() {
+	*x = PathReady{}
+	mi := &file_internal_pb_agg_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PathReady) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PathReady) ProtoMessage() {}
+
+func (x *PathReady) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_pb_agg_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PathReady.ProtoReflect.Descriptor instead.
+func (*PathReady) Descriptor() ([]byte, []int) {
+	return file_internal_pb_agg_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *PathReady) GetRequestId() uint64 {
+	if x != nil {
+		return x.RequestId
+	}
+	return 0
+}
+
+func (x *PathReady) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 // Ping 是 PING 帧（帧类型 7）的 protobuf 帧体：逐路径主动探测
 // （规格书 §5.2：仅用于冷启动、est_rate 过期、疑似降级，不常态化）。
 //
@@ -245,7 +388,7 @@ type Ping struct {
 
 func (x *Ping) Reset() {
 	*x = Ping{}
-	mi := &file_internal_pb_agg_proto_msgTypes[4]
+	mi := &file_internal_pb_agg_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -257,7 +400,7 @@ func (x *Ping) String() string {
 func (*Ping) ProtoMessage() {}
 
 func (x *Ping) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_pb_agg_proto_msgTypes[4]
+	mi := &file_internal_pb_agg_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -270,7 +413,7 @@ func (x *Ping) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Ping.ProtoReflect.Descriptor instead.
 func (*Ping) Descriptor() ([]byte, []int) {
-	return file_internal_pb_agg_proto_rawDescGZIP(), []int{4}
+	return file_internal_pb_agg_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Ping) GetSendTs() uint64 {
@@ -300,7 +443,7 @@ type Telemetry struct {
 
 func (x *Telemetry) Reset() {
 	*x = Telemetry{}
-	mi := &file_internal_pb_agg_proto_msgTypes[5]
+	mi := &file_internal_pb_agg_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -312,7 +455,7 @@ func (x *Telemetry) String() string {
 func (*Telemetry) ProtoMessage() {}
 
 func (x *Telemetry) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_pb_agg_proto_msgTypes[5]
+	mi := &file_internal_pb_agg_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -325,7 +468,7 @@ func (x *Telemetry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Telemetry.ProtoReflect.Descriptor instead.
 func (*Telemetry) Descriptor() ([]byte, []int) {
-	return file_internal_pb_agg_proto_rawDescGZIP(), []int{5}
+	return file_internal_pb_agg_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *Telemetry) GetRates() []*PathRate {
@@ -348,7 +491,7 @@ type PathRate struct {
 
 func (x *PathRate) Reset() {
 	*x = PathRate{}
-	mi := &file_internal_pb_agg_proto_msgTypes[6]
+	mi := &file_internal_pb_agg_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -360,7 +503,7 @@ func (x *PathRate) String() string {
 func (*PathRate) ProtoMessage() {}
 
 func (x *PathRate) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_pb_agg_proto_msgTypes[6]
+	mi := &file_internal_pb_agg_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -373,7 +516,7 @@ func (x *PathRate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PathRate.ProtoReflect.Descriptor instead.
 func (*PathRate) Descriptor() ([]byte, []int) {
-	return file_internal_pb_agg_proto_rawDescGZIP(), []int{6}
+	return file_internal_pb_agg_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PathRate) GetPathId() uint64 {
@@ -404,7 +547,19 @@ const file_internal_pb_agg_proto_rawDesc = "" +
 	"\ragg_stream_id\x18\x01 \x01(\fR\vaggStreamId\x12\x17\n" +
 	"\apath_id\x18\x02 \x01(\x04R\x06pathId\"#\n" +
 	"\bPathDrop\x12\x17\n" +
-	"\apath_id\x18\x01 \x01(\x04R\x06pathId\"5\n" +
+	"\apath_id\x18\x01 \x01(\x04R\x06pathId\"\x85\x01\n" +
+	"\vPathRequest\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x1d\n" +
+	"\n" +
+	"relay_peer\x18\x02 \x01(\fR\trelayPeer\x12\x1f\n" +
+	"\vrelay_addrs\x18\x03 \x03(\fR\n" +
+	"relayAddrs\x12\x17\n" +
+	"\aac_addr\x18\x04 \x01(\fR\x06acAddr\"@\n" +
+	"\tPathReady\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"5\n" +
 	"\x04Ping\x12\x17\n" +
 	"\asend_ts\x18\x01 \x01(\x04R\x06sendTs\x12\x14\n" +
 	"\x05reply\x18\x02 \x01(\bR\x05reply\"6\n" +
@@ -426,18 +581,20 @@ func file_internal_pb_agg_proto_rawDescGZIP() []byte {
 	return file_internal_pb_agg_proto_rawDescData
 }
 
-var file_internal_pb_agg_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_internal_pb_agg_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_internal_pb_agg_proto_goTypes = []any{
-	(*Hello)(nil),      // 0: netacc.v1.Hello
-	(*HelloAck)(nil),   // 1: netacc.v1.HelloAck
-	(*PathAttach)(nil), // 2: netacc.v1.PathAttach
-	(*PathDrop)(nil),   // 3: netacc.v1.PathDrop
-	(*Ping)(nil),       // 4: netacc.v1.Ping
-	(*Telemetry)(nil),  // 5: netacc.v1.Telemetry
-	(*PathRate)(nil),   // 6: netacc.v1.PathRate
+	(*Hello)(nil),       // 0: netacc.v1.Hello
+	(*HelloAck)(nil),    // 1: netacc.v1.HelloAck
+	(*PathAttach)(nil),  // 2: netacc.v1.PathAttach
+	(*PathDrop)(nil),    // 3: netacc.v1.PathDrop
+	(*PathRequest)(nil), // 4: netacc.v1.PathRequest
+	(*PathReady)(nil),   // 5: netacc.v1.PathReady
+	(*Ping)(nil),        // 6: netacc.v1.Ping
+	(*Telemetry)(nil),   // 7: netacc.v1.Telemetry
+	(*PathRate)(nil),    // 8: netacc.v1.PathRate
 }
 var file_internal_pb_agg_proto_depIdxs = []int32{
-	6, // 0: netacc.v1.Telemetry.rates:type_name -> netacc.v1.PathRate
+	8, // 0: netacc.v1.Telemetry.rates:type_name -> netacc.v1.PathRate
 	1, // [1:1] is the sub-list for method output_type
 	1, // [1:1] is the sub-list for method input_type
 	1, // [1:1] is the sub-list for extension type_name
@@ -456,7 +613,7 @@ func file_internal_pb_agg_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_pb_agg_proto_rawDesc), len(file_internal_pb_agg_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
