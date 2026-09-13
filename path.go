@@ -79,14 +79,31 @@ func (p *path) connID() string {
 	return ""
 }
 
+// transport 返回该路径的底层传输类型。优先看本端 multiaddr：入向
+// WebRTC-direct 连接的对端地址只是裸 /udp/...（监听侧从 ICE 候选反推，
+// 不带 /webrtc-direct 段），而本端监听地址始终带传输标记；本端判不出
+// 再退到对端地址（出向直拨地址必带传输段）。
+func (p *path) transport() PathTransport {
+	if la, ok := p.localAddr().(maAddr); ok {
+		if t := PathTransportOf(la.ma); t != TransportUnknown {
+			return t
+		}
+	}
+	if ra, ok := p.remoteAddr().(maAddr); ok {
+		return PathTransportOf(ra.ma)
+	}
+	return TransportUnknown
+}
+
 // PathInfo 是一条数据路径的观测快照（规格书 §8 Paths()）。
 // 逐路径 RTT/est_rate/inflight 指标属调度器（#20），此处先给身份与归属。
 type PathInfo struct {
-	ID     uint64   // path_id（创建方命名空间，两端视图一致）
-	Dialed bool     // 本侧是否为该路径的发起方
-	ConnID string   // 底层连接标识（同 peer 多连接并存时的归属判据）
-	Local  net.Addr // 本端地址（multiaddr 包装，取不到为 nil）
-	Remote net.Addr // 对端地址
+	ID        uint64        // path_id（创建方命名空间，两端视图一致）
+	Dialed    bool          // 本侧是否为该路径的发起方
+	ConnID    string        // 底层连接标识（同 peer 多连接并存时的归属判据）
+	Transport PathTransport // 底层传输类型（规格书 §3.3，供 #20/#24 消费）
+	Local     net.Addr      // 本端地址（multiaddr 包装，取不到为 nil）
+	Remote    net.Addr      // 对端地址
 }
 
 // ---------- PATH_ATTACH / PATH_DROP 帧体 ----------
@@ -141,6 +158,24 @@ func (s *Stream) attachPath(p *path, fr *frameReader) error {
 // 对称性：发起/接收两侧都可调用（规格书 §4.3 双向对称加路径，
 // 覆盖 NAT 后只能出向的一端——出向拨号即可）。
 // addr 可带可不带 /p2p/<peerID> 后缀。
+//
+// 支持的地址形态（规格书 §3.3 全传输矩阵，#22 验证）：
+//   - TCP：/ip4|dns4/.../tcp/<port>
+//   - WebSocket：.../tcp/<port>/ws；加密形态 .../tls/sni/<host>/ws
+//     或 /wss 简写（wss 要求对端证书过系统 CA 校验，且对端监听侧
+//     配了 WithTLSConfig——go-libp2p 自签证书过不了，跨组织部署
+//     一般靠前置反代终结 TLS）
+//   - QUIC：/ip4|dns4/.../udp/<port>/quic-v1
+//   - WebTransport：.../udp/<port>/quic-v1/webtransport/certhash/<hash>
+//   - WebRTC-direct：.../udp/<port>/webrtc-direct/certhash/<hash>
+//
+// certhash 由对端实时证书决定且会轮换（WT 证书 ≤14 天），地址过期
+// 属预期行为：本库不内建地址发现，拨号报「certhash 校验失败/缺
+// certhash」时调用方经 identify/地址簿换新地址重试即可。
+//
+// UDP 系（QUIC/WT/WebRTC）同生共死：运营商整类限速 UDP 时三者
+// 一起降速，本接口不做协议级规避切换——调度器按实测带宽自动降权
+// （#20）；要绕 UDP QoS 请备 TCP/WS 地址。
 func (s *Stream) AddPath(ctx context.Context, addr ma.Multiaddr) (uint64, error) {
 	if s.agg == nil {
 		return 0, errors.New("netacc: 该聚合流不经 Aggregator 创建，无法拨号加路径")
@@ -232,11 +267,12 @@ func (s *Stream) Paths() []PathInfo {
 	out := make([]PathInfo, 0, len(s.paths))
 	for _, p := range s.paths {
 		out = append(out, PathInfo{
-			ID:     p.id,
-			Dialed: p.dialed,
-			ConnID: p.connID(),
-			Local:  p.localAddr(),
-			Remote: p.remoteAddr(),
+			ID:        p.id,
+			Dialed:    p.dialed,
+			ConnID:    p.connID(),
+			Transport: p.transport(),
+			Local:     p.localAddr(),
+			Remote:    p.remoteAddr(),
 		})
 	}
 	return out
