@@ -97,7 +97,7 @@ func marshalPathReady(reqID uint64, rerr error) ([]byte, error) {
 // 电路地址里内嵌的那一条。
 func (s *Stream) AddRelayPath(ctx context.Context, relay peer.AddrInfo) (uint64, error) {
 	if s.agg == nil {
-		return 0, errors.New("netacc: 该聚合流不经 Aggregator 创建，无法拨号加路径")
+		return 0, ErrNoAggregator
 	}
 	if relay.ID == "" {
 		return 0, errors.New("netacc: 中继路径描述符缺 relay peerID")
@@ -323,7 +323,7 @@ func (s *Stream) writeCtrl(ft frameType, body []byte) error {
 		p := s.sched.pickAck(s.paths, time.Now())
 		s.mu.Unlock()
 		if p == nil {
-			return errNoPaths
+			return ErrNoPaths
 		}
 		p.wmu.Lock()
 		_, err := p.conn.Write(buf)
@@ -359,8 +359,10 @@ func (s *Stream) attachDialedConn(ctx context.Context, cc transport.CapableConn,
 		return fmt.Errorf("netacc: 协商 %s 失败: %w", PathProtocolID, err)
 	}
 
-	// 绑定握手受 ctx/握手超时约束：deadline 传导到子流 + 看守兜底 reset
-	hsCtx, cancel := s.agg.handshakeCtx(ctx)
+	// 绑定握手受 ctx/握手超时约束：deadline 传导到子流 + 看守兜底 reset。
+	// 超时取本流生效值（OpenStream 逐调用 WithHandshakeTimeout 覆盖
+	// 构造默认后的结果，#25）。
+	hsCtx, cancel := s.agg.handshakeCtxWith(ctx, s.cfg.handshakeTimeout)
 	defer cancel()
 	stop := watchStreamCtx(ms, hsCtx)
 	defer stop()
