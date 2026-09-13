@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package netacc.v1;
+
+// go_package 与本目录一致。
+// 重新生成：protoc --go_out=. --go_opt=paths=source_relative internal/pb/agg.proto
+option go_package = "github.com/yangjuncode/netacc/internal/pb";
+
+// Hello 是握手发起方在握手流（protocol /netacc/agg/1.0.0）上发出的第一个
+// 控制消息，用于协商一条新聚合流的参数（规格书 §4.1）。
+message Hello {
+  // agg_stream_id：发起方生成的 128bit 随机聚合流标识。
+  // 后续所有数据路径的 PATH_ATTACH 凭此 ID 绑定到同一条聚合流。
+  bytes agg_stream_id = 1;
+}
+
+// HelloAck 是接收方对 Hello 的应答：回显 agg_stream_id 即表示接受。
+// 应答发出后，握手流升格为该聚合流的第一条数据路径（分离+复用混合，
+// 规格书 §4.1）。
+message HelloAck {
+  bytes agg_stream_id = 1;
+}
