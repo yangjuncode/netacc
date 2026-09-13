@@ -2,7 +2,6 @@ package netacc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -64,6 +63,16 @@ type path struct {
 	rxMark  uint64    // 上个回报周期结束时 rxBytes 快照
 	rxMarkT time.Time // 上个回报周期结束时刻
 	rxRate  float64   // 平滑后的到达速率估计（字节/秒）
+
+	// 重传与降级记账（#25，Stats()/事件的数据源）：
+	// resentSegs/resentBytes 是本路径上重发出的段数与字节数
+	// （死路径遗留段换路后在本路径重新装帧下发时累加，见 trySend）；
+	// degraded 标记「疑似降级」沿状态——onTick 判到指标曾有效但
+	// 失联时置位并发 EventPathDegraded，恢复新鲜后复位，保证
+	// 每次失联只报一次。
+	resentSegs  uint64
+	resentBytes uint64
+	degraded    bool
 
 	lastPingAt time.Time // 上次主动 PING 时刻（节流）
 }
@@ -131,7 +140,8 @@ func (p *path) transport() PathTransport {
 }
 
 // PathInfo 是一条数据路径的观测快照（规格书 §8 Paths()）。
-// #20 起附逐路径调度指标只读快照，为 #25 的 Stats() 铺路。
+// #20 起附逐路径调度指标只读快照；#25 的 Stats() 在其上再加
+// 收发/重传累计计数（见 PathStats），事件通知也携带本结构。
 type PathInfo struct {
 	ID        uint64        // path_id（创建方命名空间，两端视图一致）
 	Dialed    bool          // 本侧是否为该路径的发起方
@@ -186,6 +196,9 @@ func (s *Stream) attachPath(p *path, fr *frameReader) error {
 	s.paths = append(s.paths, p)
 	s.pathsByID[p.id] = p
 	s.mu.Unlock()
+	// 事件订阅（#25）：挂接完成即发 PathAdded（此刻指标全零，
+	// 快照如实呈现冷路径）。非阻塞派发，订阅者慢不影响挂接。
+	s.emitEvent(EventPathAdded, s.pathInfoOf(p), nil)
 	if fr == nil {
 		fr = newFrameReader(p.conn)
 	}
@@ -228,7 +241,7 @@ func (s *Stream) attachPath(p *path, fr *frameReader) error {
 // （#20）；要绕 UDP QoS 请备 TCP/WS 地址。
 func (s *Stream) AddPath(ctx context.Context, addr ma.Multiaddr) (uint64, error) {
 	if s.agg == nil {
-		return 0, errors.New("netacc: 该聚合流不经 Aggregator 创建，无法拨号加路径")
+		return 0, ErrNoAggregator
 	}
 	// 预定本侧命名空间的 path_id（先取号再拨号：即便拨号失败，
 	// 作废一个 id 也无碍——已用 id 永不复用）
@@ -299,15 +312,33 @@ func (s *Stream) RemovePath(pathID uint64) error {
 	p := s.pathsByID[pathID]
 	if p == nil {
 		s.mu.Unlock()
-		return fmt.Errorf("netacc: 未知 path_id %d", pathID)
+		return fmt.Errorf("netacc: %w %d", ErrUnknownPath, pathID)
 	}
 	if len(s.paths) <= 1 {
 		s.mu.Unlock()
-		return errors.New("netacc: 不能摘除最后一条数据路径")
+		return ErrLastPath
 	}
 	s.mu.Unlock()
 	s.dropPath(p, nil, true)
 	return nil
+}
+
+// info 组装本路径的 PathInfo 快照。指标字段归所属 Stream.mu
+// 保护（调用方须持 mu）；connID/localAddr/transport 只依赖
+// 不可变的 conn/own 指针，同语境下安全。
+func (p *path) info(now time.Time) PathInfo {
+	return PathInfo{
+		ID:        p.id,
+		Dialed:    p.dialed,
+		ConnID:    p.connID(),
+		Transport: p.transport(),
+		Local:     p.localAddr(),
+		Remote:    p.remoteAddr(),
+		SRTT:      p.srtt,
+		MinRTT:    p.minRTT,
+		EstRate:   p.effRate(now),
+		Inflight:  p.inflight,
+	}
 }
 
 // Paths 返回当前存活数据路径的观测快照（规格书 §8）。
@@ -317,18 +348,7 @@ func (s *Stream) Paths() []PathInfo {
 	now := time.Now()
 	out := make([]PathInfo, 0, len(s.paths))
 	for _, p := range s.paths {
-		out = append(out, PathInfo{
-			ID:        p.id,
-			Dialed:    p.dialed,
-			ConnID:    p.connID(),
-			Transport: p.transport(),
-			Local:     p.localAddr(),
-			Remote:    p.remoteAddr(),
-			SRTT:      p.srtt,
-			MinRTT:    p.minRTT,
-			EstRate:   p.effRate(now),
-			Inflight:  p.inflight,
-		})
+		out = append(out, p.info(now))
 	}
 	return out
 }
