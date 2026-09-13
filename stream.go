@@ -1,6 +1,7 @@
 package netacc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -81,6 +82,13 @@ type streamConfig struct {
 	// （#25 逐调用 WithHandshakeTimeout 的载体；≤0 = 不加额外超时，
 	// 语义由 handshakeCtxWith 处理，此处不做零值收敛）。
 	handshakeTimeout time.Duration
+	// policy 是流级路径策略钩子（#24，规格 §8）：nil 关闭自动化，
+	// 手动 AddPath/RemovePath 不受影响。取值由 Aggregator 选项
+	// （WithPolicy）与 OpenStream 逐调用选项（WithStreamPolicy）落到。
+	policy Policy
+	// policyCooldown 是自动拨号冷却/退避基数；0 取
+	// defaultPolicyCooldown。供测试调快收敛，不对外公开。
+	policyCooldown time.Duration
 }
 
 // windowCap 计算建流时的初始重排缓冲容量（= 连接级接收窗口），
@@ -190,6 +198,22 @@ type Stream struct {
 	done      chan struct{} // 流终态（Close/shutdown 关闭）
 	closeOnce sync.Once
 
+	// ---- 路径策略层（#24，见 policy.go 文件头注释）----
+	// policy 构造期确定后只读，其余字段均 mu 保护（policyEvalActive
+	// 例外：发送泵触发、评估 goroutine 持有，用 atomic 去抖）。
+	policy           Policy      // nil = 关闭自动化
+	policyEvalActive atomic.Bool // 同流同一时刻至多一拍评估在途
+	policyDialActive bool        // 一笔自动拨号在途（串行化加路径）
+	backlogSince     time.Time   // 发送积压起始（「需求>供给」信号）
+	nextAutoAddAt    time.Time   // 冷却/退避到期：此刻前不自动拨号
+	autoAddFails     int         // 连续自动挂接失败计数（退避输入）
+	// policyDialFn/policyAddrsFn 是测试 seam：生产默认 AddPath 与
+	// peerstore 取址；pipe 级测试注入管道实现以避开真实网络。
+	// 约定：须在 start() 前注入；policyAddrsFn 在 mu 下调用，实现
+	// 不得阻塞或重入 s.mu。
+	policyDialFn  func(ctx context.Context, addr ma.Multiaddr) (uint64, error)
+	policyAddrsFn func() []ma.Multiaddr
+
 	rDeadline atomic.Int64 // unixnano，0 = 无 deadline
 	wDeadline atomic.Int64
 }
@@ -240,7 +264,9 @@ func newStreamFull(id [16]byte, pc pathConn, cfg streamConfig, agg *Aggregator, 
 		wChange:      make(chan struct{}),
 		seenRemote:   make(map[uint64]struct{}),
 		pendingRelay: make(map[uint64]chan error),
+		policy:       cfg.policy,
 	}
+	s.policyDialFn = s.AddPath // 生产拨号路径；测试可换 stub
 	s.rbuf = *newReorderBuf(cfg.windowCap())
 	// 首条路径 = 握手流升格，path_id 恒为发起方命名空间的 0，
 	// 两端视图一致（PATH_DROP 据此寻址）。
@@ -423,6 +449,11 @@ func (s *Stream) onTick() {
 	}
 	for _, p := range toPing {
 		go s.sendPing(p, false, s.sendTs())
+	}
+	// 路径策略评估（#24）：Decide 是应用代码、决策执行含拨号 I/O，
+	// 一律异步出泵；runPolicy 内 policyEvalActive 去抖保证串行。
+	if s.policy != nil {
+		go s.runPolicy()
 	}
 }
 

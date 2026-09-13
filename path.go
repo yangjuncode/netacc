@@ -75,6 +75,10 @@ type path struct {
 	degraded    bool
 
 	lastPingAt time.Time // 上次主动 PING 时刻（节流）
+
+	// ---- 路径策略层记账（#24，同由所属 Stream.mu 保护）----
+	auto     bool      // 是否由自动策略补挂（保守摘除只动这类路径）
+	lowSince time.Time // 速率份额持续垫底起始时刻（policySnapshot 维护）
 }
 
 // localAddr 返回本端地址（尽力而为：优先底层连接 multiaddr，退化 net.Addr）。
@@ -149,6 +153,11 @@ type PathInfo struct {
 	Transport PathTransport // 底层传输类型（规格书 §3.3，供 #20/#24 消费）
 	Local     net.Addr      // 本端地址（multiaddr 包装，取不到为 nil）
 	Remote    net.Addr      // 对端地址
+	// AttachedAt 是挂接时刻（策略层热身期/路径年龄判定用）。
+	AttachedAt time.Time
+	// AutoAdded 标记该路径由自动策略补挂（#24：默认策略的保守
+	// 摘除只动这类路径，手动加的一律不碰）。
+	AutoAdded bool
 
 	// ---- 调度指标快照（无样本时为零值）----
 	SRTT     time.Duration // 平滑 RTT（含底层排队延迟）
@@ -323,21 +332,24 @@ func (s *Stream) RemovePath(pathID uint64) error {
 	return nil
 }
 
-// info 组装本路径的 PathInfo 快照。指标字段归所属 Stream.mu
+// info 组装本路径的 PathInfo 快照（供 Paths、Stats、策略层
+// policySnapshot 与事件订阅共用）。指标字段归所属 Stream.mu
 // 保护（调用方须持 mu）；connID/localAddr/transport 只依赖
 // 不可变的 conn/own 指针，同语境下安全。
 func (p *path) info(now time.Time) PathInfo {
 	return PathInfo{
-		ID:        p.id,
-		Dialed:    p.dialed,
-		ConnID:    p.connID(),
-		Transport: p.transport(),
-		Local:     p.localAddr(),
-		Remote:    p.remoteAddr(),
-		SRTT:      p.srtt,
-		MinRTT:    p.minRTT,
-		EstRate:   p.effRate(now),
-		Inflight:  p.inflight,
+		ID:         p.id,
+		Dialed:     p.dialed,
+		ConnID:     p.connID(),
+		Transport:  p.transport(),
+		Local:      p.localAddr(),
+		Remote:     p.remoteAddr(),
+		AttachedAt: p.attachedAt,
+		AutoAdded:  p.auto,
+		SRTT:       p.srtt,
+		MinRTT:     p.minRTT,
+		EstRate:    p.effRate(now),
+		Inflight:   p.inflight,
 	}
 }
 

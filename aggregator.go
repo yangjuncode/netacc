@@ -7,7 +7,8 @@
 // 对称加路径 + 轮询条带）由 #19 落地，见 path.go；中继路径按需协调
 // （PATH_REQUEST → reservation → PATH_READY → CONNECT）由 #21 落地，
 // 见 relaypath.go；调度器在 #20（scheduler.go）；观测面（Stats 快照 +
-// 事件订阅 + 选项/错误语义收尾）由 #25 落地，见 stats.go。
+// 事件订阅 + 选项/错误语义收尾）由 #25 落地，见 stats.go；路径策略层
+// （内建自动策略 + 可插拔钩子）在 #24，见 policy.go。
 package netacc
 
 import (
@@ -116,6 +117,12 @@ type aggOption func(*options)
 
 func (f aggOption) applyOption(o *options) { f(o) }
 
+// openOption 是仅逐调用侧生效的选项实现（不满足 Option，
+// 误传给 New 会在编译期被拦下）。
+type openOption func(*openOptions)
+
+func (f openOption) applyOpenOption(o *openOptions) { f(o) }
+
 // options 是 Aggregator 级配置（New 的默认值集合）。
 type options struct {
 	// acceptBacklog：已完成底层建流、等待 Accept 消费的最大排队数。
@@ -128,6 +135,9 @@ type options struct {
 	// minPaths：OpenStream 的默认成功门槛——至少 n 条数据路径
 	// attached（规格书 §8；OpenStream 可逐调用覆盖）。
 	minPaths int
+	// policy：聚合流默认路径策略（#24，规格书 §8 可插拔钩子）。
+	// nil = 关闭自动化；默认见 New（DefaultPolicy()）。
+	policy Policy
 }
 
 // openOptions 是单次 OpenStream 的生效配置：先从 Aggregator 默认
@@ -137,6 +147,9 @@ type openOptions struct {
 	handshakeTimeout time.Duration
 	reorderMin       int
 	reorderMax       int
+	// policy：该条流的策略覆盖（WithStreamPolicy）；未给时沿用
+	// Aggregator 默认（defaultOpenOptions 先填 a.opts.policy）。
+	policy Policy
 }
 
 // WithAcceptBacklog 设置等待 Accept 的入向握手流排队长度（默认 16）。
@@ -216,6 +229,11 @@ type Aggregator struct {
 // 仅 TCP+WebSocket（其余传输不支持 PSK）。自定义传输集时把想要
 // 的传输用 libp2p.Transport(...) 注册进 host 即可，本库无需额外
 // 配置。
+//
+// 路径策略（#24）：每条聚合流默认启用内建自动策略（实测供给不足时
+// 按 §3.3 偏好补直连路径、保守摘除垫底冗余路径）；WithPolicy 替换、
+// WithPolicy(nil) 关闭，OpenStream 可经 WithStreamPolicy 逐调用覆盖；
+// 手动 AddPath/RemovePath/AddRelayPath 与策略并存。
 func New(h host.Host, opts ...Option) *Aggregator {
 	a := &Aggregator{
 		host: h,
@@ -225,6 +243,10 @@ func New(h host.Host, opts ...Option) *Aggregator {
 			reorderMin:       defaultMinReorderBuf,
 			reorderMax:       defaultMaxReorderBuf,
 			minPaths:         1, // 规格书 §8 默认：≥1 条数据路径 attached 即成功
+			// 默认开启内建自动策略（决策票 #12 未定默认开关——取
+			// 「默认开但可关」：规格 §8 将其列为内建能力，关闭须
+			// 显式 WithPolicy(nil)）。
+			policy: DefaultPolicy(),
 		},
 		streams: make(map[[16]byte]*Stream),
 	}
@@ -377,6 +399,7 @@ func (a *Aggregator) defaultOpenOptions() openOptions {
 		handshakeTimeout: a.opts.handshakeTimeout,
 		reorderMin:       a.opts.reorderMin,
 		reorderMax:       a.opts.reorderMax,
+		policy:           a.opts.policy,
 	}
 }
 
@@ -482,6 +505,7 @@ func (a *Aggregator) streamCfg(oo openOptions) streamConfig {
 		minBuf:           oo.reorderMin,
 		maxBuf:           oo.reorderMax,
 		handshakeTimeout: oo.handshakeTimeout,
+		policy:           oo.policy,
 	}
 }
 
