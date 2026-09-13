@@ -21,6 +21,8 @@ const (
 	DefaultMinShare = 64 << 10
 	// maxChunk 单次取令牌的最大块，须 ≤ burst。
 	maxChunk = 64 << 10
+	// ewmaAlpha 观测速率 EWMA 的旧值权重。
+	ewmaAlpha = 0.5
 )
 
 // bucket 是一个对端 peer 的共享限速桶：同一 peerID 的全部连接/流共用。
@@ -28,6 +30,7 @@ type bucket struct {
 	lim    *rate.Limiter // 每 peer 令牌桶，速率由重算器热更
 	cur    atomic.Int64  // 本周期已读字节
 	waited atomic.Bool   // 本周期是否发生过令牌等待（= 被限速，需求不封顶）
+	refs   atomic.Int64  // 持有本桶的活跃流数；归零且需求衰减后桶可回收
 	demand float64       // 需求估计，字节/秒
 	share  float64       // 当前配额，字节/秒
 }
@@ -40,19 +43,19 @@ type bucket struct {
 // 需求信号（原型 #15 实测结论）：本周期发生过令牌等待 → 需求视为不封顶；
 // 未等待才用观测速率 EWMA。直接用观测速率当需求会配额缩水死亡螺旋。
 type Allocator struct {
-	total     float64       // 中继总容量 R，字节/秒
-	interval  time.Duration // 重算周期
-	burst     int           // 每桶突发
-	minShare  float64       // 保底份额
-	ewmaAlpha float64       // 观测速率 EWMA 系数
+	total    float64       // 中继总容量 R，字节/秒
+	interval time.Duration // 重算周期
+	burst    int           // 每桶突发
+	minShare float64       // 保底份额
 
 	global *rate.Limiter // cap=R 全局桶
 
 	mu      sync.Mutex
 	buckets map[peer.ID]*bucket
 
-	stopCh chan struct{}
-	doneCh chan struct{}
+	stopCh    chan struct{}
+	doneCh    chan struct{}
+	closeOnce sync.Once
 }
 
 // AllocatorOption 调整 Allocator 参数。
@@ -95,14 +98,13 @@ func WithMinShare(v float64) AllocatorOption {
 // totalBytesPerSec 为中继总容量 R。用 Close 停止。
 func NewAllocator(totalBytesPerSec float64, opts ...AllocatorOption) *Allocator {
 	a := &Allocator{
-		total:     totalBytesPerSec,
-		interval:  DefaultRecomputeInterval,
-		burst:     DefaultBurst,
-		minShare:  DefaultMinShare,
-		ewmaAlpha: 0.5,
-		buckets:   map[peer.ID]*bucket{},
-		stopCh:    make(chan struct{}),
-		doneCh:    make(chan struct{}),
+		total:    totalBytesPerSec,
+		interval: DefaultRecomputeInterval,
+		burst:    DefaultBurst,
+		minShare: DefaultMinShare,
+		buckets:  map[peer.ID]*bucket{},
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(a)
@@ -115,15 +117,13 @@ func NewAllocator(totalBytesPerSec float64, opts ...AllocatorOption) *Allocator 
 	return a
 }
 
-// Close 停止后台重算 goroutine，幂等。
+// Close 停止后台重算 goroutine，幂等且并发安全。
+// 关闭后已下发到各桶的速率保持原值，装饰器仍可读但不再重算。
 func (a *Allocator) Close() {
-	select {
-	case <-a.doneCh:
-		return
-	default:
-	}
-	close(a.stopCh)
-	<-a.doneCh
+	a.closeOnce.Do(func() {
+		close(a.stopCh)
+		<-a.doneCh
+	})
 }
 
 func (a *Allocator) loop() {
@@ -144,6 +144,10 @@ func (a *Allocator) loop() {
 func (a *Allocator) bucketFor(p peer.ID) *bucket {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.bucketForLocked(p)
+}
+
+func (a *Allocator) bucketForLocked(p peer.ID) *bucket {
 	b := a.buckets[p]
 	if b == nil {
 		b = &bucket{lim: rate.NewLimiter(rate.Limit(a.total), a.burst)}
@@ -154,7 +158,19 @@ func (a *Allocator) bucketFor(p peer.ID) *bucket {
 	return b
 }
 
-// recompute 采样需求 → progressive filling → SetLimit 热更。
+// acquireBucket 取共享桶并登记一条活跃流引用。refs++ 与 recompute 的
+// 空闲回收在同一把 mu 下串行，保证「判 refs==0 → 删桶」不会被并发开流击穿。
+// 流 Close/Reset 时经 limStream.release 归还引用。
+func (a *Allocator) acquireBucket(p peer.ID) *bucket {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	b := a.bucketForLocked(p)
+	b.refs.Add(1)
+	return b
+}
+
+// recompute 采样需求 → progressive filling → SetLimit 热更，
+// 并回收无活跃流且需求已衰减的空闲桶。
 func (a *Allocator) recompute() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -169,7 +185,14 @@ func (a *Allocator) recompute() {
 			// 被限速过 → 需求不封顶，交给 progressive filling 均分
 			b.demand = a.total
 		} else {
-			b.demand = a.ewmaAlpha*b.demand + (1-a.ewmaAlpha)*observed
+			b.demand = ewmaAlpha*b.demand + (1-ewmaAlpha)*observed
+		}
+		// 回收空闲桶：没有活跃流且需求已衰减到保底以下的桶既占内存，
+		// 每轮还白拿一份 minShare——累积多了会挤占活跃 peer 的配额
+		// （白名单只挡 RESERVE/CONNECT，任何 peer 连进来开流都会建桶）。
+		if b.refs.Load() == 0 && b.demand <= a.minShare {
+			delete(a.buckets, p)
+			continue
 		}
 		peers = append(peers, p)
 		demands = append(demands, b.demand)

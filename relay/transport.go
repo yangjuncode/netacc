@@ -2,6 +2,7 @@ package netaccrelay
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -24,8 +25,9 @@ import (
 // 打到配额的一半以下（实测恰好 ~R/2）。
 type limStream struct {
 	network.MuxedStream
-	a *Allocator
-	b *bucket
+	a        *Allocator
+	b        *bucket
+	released atomic.Bool // 桶引用是否已归还（Close/Reset 幂等）
 }
 
 func (s *limStream) Read(p []byte) (int, error) {
@@ -41,6 +43,23 @@ func (s *limStream) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// release 归还桶引用：流关闭后 Allocator 才能在空闲时回收该桶。
+func (s *limStream) release() {
+	if s.released.CompareAndSwap(false, true) {
+		s.b.refs.Add(-1)
+	}
+}
+
+func (s *limStream) Close() error {
+	s.release()
+	return s.MuxedStream.Close()
+}
+
+func (s *limStream) Reset() error {
+	s.release()
+	return s.MuxedStream.Reset()
+}
+
 // shapedConn 装饰 transport.CapableConn：AcceptStream/OpenStream 产出的
 // MuxedStream 全部按对端 peerID 套共享限速桶。
 // 对 relay/identify/协议协商完全透明——接口不变，仅 Read 变慢。
@@ -53,7 +72,7 @@ func (c *shapedConn) wrap(s network.MuxedStream, err error) (network.MuxedStream
 	if err != nil {
 		return nil, err
 	}
-	return &limStream{MuxedStream: s, a: c.a, b: c.a.bucketFor(c.RemotePeer())}, nil
+	return &limStream{MuxedStream: s, a: c.a, b: c.a.acquireBucket(c.RemotePeer())}, nil
 }
 
 func (c *shapedConn) AcceptStream() (network.MuxedStream, error) {

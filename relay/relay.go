@@ -24,6 +24,8 @@
 package netaccrelay
 
 import (
+	"errors"
+
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	relay "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
@@ -38,6 +40,10 @@ const (
 	// DefaultBufferSize 默认转发缓冲，大流量场景取 64KiB。
 	DefaultBufferSize = 64 << 10
 )
+
+// ErrNoACL 在 New 未配置任何 ACL 且未显式 WithAllowAll 时返回：
+// 中继默认 fail-closed，防止误起一个人人可用的开放中继。
+var ErrNoACL = errors.New("netaccrelay: 未配置 ACLFilter——用 WithWhitelist/WithACLFilter 设置白名单，或显式 WithAllowAll 运行开放中继")
 
 // Relay 是装配好的中继组件：原生 relay 服务 + 配额重算器 + ACL。
 type Relay struct {
@@ -54,6 +60,7 @@ type config struct {
 	bandwidth float64
 	allocOpts []AllocatorOption
 	acl       relay.ACLFilter
+	allowAll  bool
 	resources *relay.Resources
 	relayOpts []relay.Option
 }
@@ -76,7 +83,7 @@ func WithAllocatorOptions(opts ...AllocatorOption) Option {
 }
 
 // WithACLFilter 设访问控制过滤器（如 NewWhitelist）。
-// 不设则不挂 ACL（等价于放行一切，慎用）。
+// New 要求必须配置 ACL：不传本选项也不传 WithAllowAll 会返回 ErrNoACL。
 func WithACLFilter(acl relay.ACLFilter) Option {
 	return func(c *config) { c.acl = acl }
 }
@@ -86,7 +93,15 @@ func WithWhitelist(peers ...peer.ID) Option {
 	return func(c *config) { c.acl = NewWhitelist(peers...) }
 }
 
-// WithResources 设 relay 资源参数（MaxCircuits/ReservationTTL/BufferSize 等）。
+// WithAllowAll 显式选择不挂任何 ACL——任何 peer 都能 RESERVE/CONNECT，
+// 即开放中继。仅用于测试或完全受控的网络；公网部署勿用。
+func WithAllowAll() Option {
+	return func(c *config) { c.allowAll = true }
+}
+
+// WithResources 在 DefaultResources 之上按非零字段覆盖 relay 资源参数
+// （MaxCircuits/MaxReservations/ReservationTTL/BufferSize 等）——
+// 只设想改的字段即可，未设字段保持上游默认。
 // BufferSize 会被抬到 ≥16KiB；Limit 字段会被忽略——本组件一律解除逐电路限额
 // （WithInfiniteLimits），带宽约束由公平限速承担。
 func WithResources(rc relay.Resources) Option {
@@ -102,6 +117,9 @@ func WithRelayOptions(opts ...relay.Option) Option {
 // 直连 relay.New（跳过 EnableRelayService 的公网可达性门控），
 // 解除逐电路限额，挂 ACL 与资源参数。
 //
+// 必须显式配置访问控制：WithWhitelist/WithACLFilter，或 WithAllowAll
+// 明确选择开放中继；三者都不给返回 ErrNoACL。
+//
 // 注意：公平限速靠传输装饰器生效——host 的传输必须在建 host 时
 // 就用 TCPTransport(alloc)/alloc.WrapTransport 包装，且与这里
 // WithAllocator 传入的是同一个分配器。
@@ -109,6 +127,10 @@ func New(h host.Host, opts ...Option) (*Relay, error) {
 	c := &config{bandwidth: DefaultBandwidth}
 	for _, o := range opts {
 		o(c)
+	}
+
+	if c.acl == nil && !c.allowAll {
+		return nil, ErrNoACL
 	}
 
 	alloc := c.alloc
@@ -119,14 +141,13 @@ func New(h host.Host, opts ...Option) (*Relay, error) {
 	}
 
 	rc := relay.DefaultResources()
-	rc.Limit = nil // 解除逐电路限额
 	rc.BufferSize = DefaultBufferSize
 	if c.resources != nil {
-		rc = *c.resources
-		rc.Limit = nil
-		if rc.BufferSize < MinBufferSize {
-			rc.BufferSize = MinBufferSize
-		}
+		mergeResources(&rc, *c.resources)
+	}
+	rc.Limit = nil // 解除逐电路限额
+	if rc.BufferSize < MinBufferSize {
+		rc.BufferSize = MinBufferSize
 	}
 
 	relayOpts := []relay.Option{relay.WithInfiniteLimits(), relay.WithResources(rc)}
@@ -143,6 +164,35 @@ func New(h host.Host, opts ...Option) (*Relay, error) {
 		return nil, err
 	}
 	return &Relay{alloc: alloc, svc: svc, ownAll: ownAll}, nil
+}
+
+// mergeResources 把 src 中的非零字段覆盖到 dst（dst 以 DefaultResources 为底）。
+// 必须合并且不能整体替换：上游 constraints 对限额用裸 >= 比较，
+// 调用方只设个别字段（如 BufferSize）时其余若为 0——例如 MaxReservations=0——
+// 会静默拒绝一切 RESERVE/CONNECT。
+// src.Limit 始终忽略（本组件解除逐电路限额）。
+func mergeResources(dst *relay.Resources, src relay.Resources) {
+	if src.ReservationTTL > 0 {
+		dst.ReservationTTL = src.ReservationTTL
+	}
+	if src.MaxReservations > 0 {
+		dst.MaxReservations = src.MaxReservations
+	}
+	if src.MaxCircuits > 0 {
+		dst.MaxCircuits = src.MaxCircuits
+	}
+	if src.BufferSize > 0 {
+		dst.BufferSize = src.BufferSize
+	}
+	if src.MaxReservationsPerPeer > 0 {
+		dst.MaxReservationsPerPeer = src.MaxReservationsPerPeer
+	}
+	if src.MaxReservationsPerIP > 0 {
+		dst.MaxReservationsPerIP = src.MaxReservationsPerIP
+	}
+	if src.MaxReservationsPerASN > 0 {
+		dst.MaxReservationsPerASN = src.MaxReservationsPerASN
+	}
 }
 
 // Allocator 返回组件使用的配额重算器。

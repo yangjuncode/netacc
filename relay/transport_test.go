@@ -78,3 +78,24 @@ func TestLimStreamReadError(t *testing.T) {
 		t.Fatalf("读错误不应计入 cur，实际 %d", b.cur.Load())
 	}
 }
+
+// TestLimStreamCloseReleasesRef 验证流 Close/Reset 归还桶引用（refs），
+// 且幂等——这是 Allocator 回收空闲桶的前提。
+func TestLimStreamCloseReleasesRef(t *testing.T) {
+	a := NewAllocator(1 << 20)
+	defer a.Close()
+
+	b := a.acquireBucket(peer.ID("p"))
+	if b.refs.Load() != 1 {
+		t.Fatalf("acquireBucket 应登记引用，refs=%d", b.refs.Load())
+	}
+	s := &limStream{MuxedStream: &fakeStream{}, a: a, b: b}
+	s.Close()
+	if b.refs.Load() != 0 {
+		t.Fatalf("Close 后 refs 应为 0，实际 %d", b.refs.Load())
+	}
+	s.Reset() // 重复释放不应再减
+	if b.refs.Load() != 0 {
+		t.Fatalf("重复释放后 refs 应保持 0，实际 %d", b.refs.Load())
+	}
+}

@@ -1,6 +1,7 @@
 package netaccrelay
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -98,12 +99,12 @@ func TestDemandSignalWaited(t *testing.T) {
 		t.Fatalf("等待过的桶需求应为总量 %v，实际 %v", a.total, b.demand)
 	}
 
-	// 未等待 + 本周期读了 1MiB（50ms 周期 → 观测 20MiB/s）→ EWMA 混合
+	// 未等待 + 本周期读了 1MiB（100ms 周期 → 观测 10MiB/s）→ EWMA 混合
 	b.waited.Store(false)
 	b.cur.Store(1 << 20)
 	a.recompute()
 	observed := float64(1<<20) / a.interval.Seconds()
-	want := 0.5*a.total + 0.5*observed // EWMA α=0.5：旧需求 100MiB/s 与新观测 20MiB/s 混合
+	want := ewmaAlpha*a.total + (1-ewmaAlpha)*observed
 	if b.demand != want {
 		t.Fatalf("未等待桶需求应为 EWMA %v，实际 %v", want, b.demand)
 	}
@@ -127,4 +128,42 @@ func TestRecomputeSetsLimits(t *testing.T) {
 	if got := a.PeerShare(peer.ID("p1")); got != total/2 {
 		t.Fatalf("PeerShare 应为 %v，实际 %v", total/2, got)
 	}
+}
+
+// TestIdleBucketEvicted 验证空闲桶回收：无活跃流且需求衰减到保底以下的桶
+// 被移出 buckets，不再每轮白占一份 minShare；仍有活跃流的桶不受影响。
+func TestIdleBucketEvicted(t *testing.T) {
+	a := NewAllocator(100<<20, WithRecomputeInterval(100*time.Millisecond))
+	defer a.Close()
+
+	idle := a.bucketFor(peer.ID("idle"))
+	idle.demand = 1 // 模拟需求已衰减到保底以下
+	idle.refs.Store(0)
+
+	busy := a.bucketFor(peer.ID("busy"))
+	busy.demand = 1
+	busy.refs.Store(1) // 仍有活跃流
+
+	a.recompute()
+	if got := a.PeerShare(peer.ID("idle")); got != 0 {
+		t.Fatalf("空闲桶应被回收，PeerShare 实际 %v", got)
+	}
+	if got := a.PeerShare(peer.ID("busy")); got == 0 {
+		t.Fatal("有活跃流的桶不应被回收")
+	}
+}
+
+// TestCloseConcurrent 验证 Close 幂等且并发安全（sync.Once 防双重 close）。
+func TestCloseConcurrent(t *testing.T) {
+	a := NewAllocator(100 << 20)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a.Close()
+		}()
+	}
+	wg.Wait()
+	a.Close() // 已关闭后再调也不应 panic
 }
