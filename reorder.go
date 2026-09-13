@@ -129,6 +129,10 @@ func (r *reorderBuf) cum() uint64 { return r.next }
 // window 返回接收窗口通告值 = 缓冲剩余量。
 func (r *reorderBuf) window() int { return r.cap - r.size }
 
+// setCap 调整容量上限（规格 §6 窗口联动：随 Σest_rate·max_srtt 重算）。
+// 缩小容量不丢弃已缓冲数据——window 变负后按 0 通告，等 Read 排空。
+func (r *reorderBuf) setCap(c int) { r.cap = c }
+
 // sizeBytes 返回当前占用字节数（含未保序暂存与未读走部分）。
 func (r *reorderBuf) sizeBytes() int { return r.size }
 

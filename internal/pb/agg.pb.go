@@ -369,6 +369,170 @@ func (x *PathReady) GetError() string {
 	return ""
 }
 
+// Ping 是 PING 帧（帧类型 7）的 protobuf 帧体：逐路径主动探测
+// （规格书 §5.2：仅用于冷启动、est_rate 过期、疑似降级，不常态化）。
+//
+// 发起方置 reply=false 携带 send_ts；接收方在同一条路径上原样回显
+// send_ts 并置 reply=true——应答固定走同路径返回，使测得的往返时延
+// 天然归属该路径（区别于 ACK 回显的「正向路径+回程最快路径」混合样本，
+// PING 样本是干净的单路径双向 RTT）。
+type Ping struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 发送时间戳：微秒，与 DATA 帧 send_ts 同一基准（相对建流时刻）。
+	SendTs uint64 `protobuf:"varint,1,opt,name=send_ts,json=sendTs,proto3" json:"send_ts,omitempty"`
+	// false=探测请求；true=对探测的应答回显。
+	Reply         bool `protobuf:"varint,2,opt,name=reply,proto3" json:"reply,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Ping) Reset() {
+	*x = Ping{}
+	mi := &file_internal_pb_agg_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Ping) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Ping) ProtoMessage() {}
+
+func (x *Ping) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_pb_agg_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Ping.ProtoReflect.Descriptor instead.
+func (*Ping) Descriptor() ([]byte, []int) {
+	return file_internal_pb_agg_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *Ping) GetSendTs() uint64 {
+	if x != nil {
+		return x.SendTs
+	}
+	return 0
+}
+
+func (x *Ping) GetReply() bool {
+	if x != nil {
+		return x.Reply
+	}
+	return false
+}
+
+// Telemetry 是 TELEMETRY 帧（帧类型 8）的 protobuf 帧体：收端周期
+// 回报其观测到的各路径到达速率，供发送端校准 est_rate
+// （规格书 §5.2：对端视角的到达速率比发端 ACK 自测更准）。
+type Telemetry struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 逐路径观测项；只包含有新到达字节的路径。
+	Rates         []*PathRate `protobuf:"bytes,1,rep,name=rates,proto3" json:"rates,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Telemetry) Reset() {
+	*x = Telemetry{}
+	mi := &file_internal_pb_agg_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Telemetry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Telemetry) ProtoMessage() {}
+
+func (x *Telemetry) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_pb_agg_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Telemetry.ProtoReflect.Descriptor instead.
+func (*Telemetry) Descriptor() ([]byte, []int) {
+	return file_internal_pb_agg_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *Telemetry) GetRates() []*PathRate {
+	if x != nil {
+		return x.Rates
+	}
+	return nil
+}
+
+// PathRate 是一条路径的收端观测速率。
+type PathRate struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 路径标识：PATH_ATTACH 时分配的 path_id，两端视图一致。
+	PathId uint64 `protobuf:"varint,1,opt,name=path_id,json=pathId,proto3" json:"path_id,omitempty"`
+	// 收端在上个回报周期内观测到的该路径到达速率（字节/秒）。
+	RateBps       uint64 `protobuf:"varint,2,opt,name=rate_bps,json=rateBps,proto3" json:"rate_bps,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PathRate) Reset() {
+	*x = PathRate{}
+	mi := &file_internal_pb_agg_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PathRate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PathRate) ProtoMessage() {}
+
+func (x *PathRate) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_pb_agg_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PathRate.ProtoReflect.Descriptor instead.
+func (*PathRate) Descriptor() ([]byte, []int) {
+	return file_internal_pb_agg_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *PathRate) GetPathId() uint64 {
+	if x != nil {
+		return x.PathId
+	}
+	return 0
+}
+
+func (x *PathRate) GetRateBps() uint64 {
+	if x != nil {
+		return x.RateBps
+	}
+	return 0
+}
+
 var File_internal_pb_agg_proto protoreflect.FileDescriptor
 
 const file_internal_pb_agg_proto_rawDesc = "" +
@@ -395,7 +559,15 @@ const file_internal_pb_agg_proto_rawDesc = "" +
 	"\tPathReady\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05errorB+Z)github.com/yangjuncode/netacc/internal/pbb\x06proto3"
+	"\x05error\x18\x02 \x01(\tR\x05error\"5\n" +
+	"\x04Ping\x12\x17\n" +
+	"\asend_ts\x18\x01 \x01(\x04R\x06sendTs\x12\x14\n" +
+	"\x05reply\x18\x02 \x01(\bR\x05reply\"6\n" +
+	"\tTelemetry\x12)\n" +
+	"\x05rates\x18\x01 \x03(\v2\x13.netacc.v1.PathRateR\x05rates\">\n" +
+	"\bPathRate\x12\x17\n" +
+	"\apath_id\x18\x01 \x01(\x04R\x06pathId\x12\x19\n" +
+	"\brate_bps\x18\x02 \x01(\x04R\arateBpsB+Z)github.com/yangjuncode/netacc/internal/pbb\x06proto3"
 
 var (
 	file_internal_pb_agg_proto_rawDescOnce sync.Once
@@ -409,7 +581,7 @@ func file_internal_pb_agg_proto_rawDescGZIP() []byte {
 	return file_internal_pb_agg_proto_rawDescData
 }
 
-var file_internal_pb_agg_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_internal_pb_agg_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_internal_pb_agg_proto_goTypes = []any{
 	(*Hello)(nil),       // 0: netacc.v1.Hello
 	(*HelloAck)(nil),    // 1: netacc.v1.HelloAck
@@ -417,13 +589,17 @@ var file_internal_pb_agg_proto_goTypes = []any{
 	(*PathDrop)(nil),    // 3: netacc.v1.PathDrop
 	(*PathRequest)(nil), // 4: netacc.v1.PathRequest
 	(*PathReady)(nil),   // 5: netacc.v1.PathReady
+	(*Ping)(nil),        // 6: netacc.v1.Ping
+	(*Telemetry)(nil),   // 7: netacc.v1.Telemetry
+	(*PathRate)(nil),    // 8: netacc.v1.PathRate
 }
 var file_internal_pb_agg_proto_depIdxs = []int32{
-	0, // [0:0] is the sub-list for method output_type
-	0, // [0:0] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	8, // 0: netacc.v1.Telemetry.rates:type_name -> netacc.v1.PathRate
+	1, // [1:1] is the sub-list for method output_type
+	1, // [1:1] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_internal_pb_agg_proto_init() }
@@ -437,7 +613,7 @@ func file_internal_pb_agg_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_pb_agg_proto_rawDesc), len(file_internal_pb_agg_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

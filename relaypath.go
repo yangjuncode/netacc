@@ -320,7 +320,7 @@ func (s *Stream) writeCtrl(ft frameType, body []byte) error {
 			s.mu.Unlock()
 			return net.ErrClosed
 		}
-		p := s.pickPathLocked()
+		p := s.sched.pickAck(s.paths, time.Now())
 		s.mu.Unlock()
 		if p == nil {
 			return errNoPaths

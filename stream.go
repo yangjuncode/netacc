@@ -68,52 +68,48 @@ type streamConfig struct {
 	// sendBufCap 是发送侧「未送达对端应用」数据总量（待发队列 +
 	// 在途未确认）的上限，防 Write 内存无限增长；与 TCP 发送缓冲
 	// 同构。默认取窗口容量的 2 倍：窗口被对端读空重新打开时，待发
-	// 队列里始终有足够数据立刻填满窗口。
+	// 队列里始终有足够数据立刻填满窗口。窗口容量随调度指标联动
+	// 重算时本值同步跟踪（见 updateWindowCapLocked）。
 	sendBufCap int
+	// telemetryInterval 是收端 TELEMETRY 回报与窗口容量重算周期
+	// （规格 §5.2/§6），默认 defaultTelemetryInterval。
+	telemetryInterval time.Duration
 }
 
-// windowCap 计算重排缓冲容量（= 连接级接收窗口），规格 §6：
-//
-//	reorder_buf = clamp(Σ est_rate_i · max_srtt_i, minBuf, maxBuf)
-//
-// 逐路径 est_rate/srtt 采样属 #20；估计量暂恒为 0 → 容量恒取下界
-// minBuf。调度器落地后在此公式内填入各路径实测值并按需重算、
-// 向对端发窗口更新即可扩容。
+// windowCap 计算建流时的初始重排缓冲容量（= 连接级接收窗口），
+// 规格 §6：reorder_buf = clamp(Σ est_rate_i · max_srtt_i, minBuf, maxBuf)。
+// 建流时无任何路径指标 → 恒取下界 minBuf；运行期容量由
+// updateWindowCapLocked 按各路径实测指标联动重算（#20 落地）。
 func (c streamConfig) windowCap() int {
-	estBDP := 0 // TODO(#20): 替换为 Σ est_rate_i · max_srtt_i（逐路径求和）
-	if estBDP < c.minBuf {
-		return c.minBuf
-	}
-	if estBDP > c.maxBuf {
-		return c.maxBuf
-	}
-	return estBDP
+	return c.minBuf
 }
 
 // Stream 是一条聚合流：对应用呈现 net.Conn 语义（可靠有序字节流）。
 //
-// 数据面（规格 §4.4/§6）：
+// 数据面（规格 §4.4/§5/§6）：
 //   - 写方向：Write → 待发队列 → 发送泵按对端通告窗口切成 DATA 帧、
-//     轮询选一条存活路径下发（帧头携带流内字节偏移与发送时间戳）；
+//     经调度器（最短排空时间优先 + 每路径 inflight 硬顶）选路下发
+//     （帧头携带流内字节偏移与发送时间戳）；
 //   - 读方向：每条路径一个接收循环解帧 → 共用同一重排缓冲保序 →
 //     Read 取走；每收一帧 DATA 回一条 ACK（累积偏移 + SACK ranges +
-//     时间戳回显 + 窗口通告），ACK 经任意存活路径回送；
+//     时间戳回显 + 回显路径归属 + 窗口通告），ACK 走低延迟路径回送；
 //   - 流控：单一聚合窗口——发送端维护 unacked（已发未累积确认），
 //     unacked ≥ 对端通告窗口时发送泵停摆，进而 Write 在发送缓冲
 //     占满后阻塞，直到对端 Read 释放窗口；
+//   - 逐路径指标：ACK ts_echo/ts_path 回显驱动 srtt/rttvar/min_rtt
+//     采样，cum 推进驱动 BBR 式 delivery-rate 估计 est_rate；收端
+//     周期发 TELEMETRY 回报各路径到达速率校准对端 est_rate；
+//     PING 仅用于新路径冷启动与指标过期探测（规格 §5.2）；
 //   - 路径集合：PATH_ATTACH 绑定新路径（path_id 分侧命名空间），
 //     路径死亡即摘除并把其在途未确认段重注入剩余路径（重排缓冲
 //     按偏移去重，重复字节安全）；PATH_DROP 带内告知对端。
 //
-// 并发结构：一个 sendLoop goroutine 独占 DATA/ACK 帧写出（路径间
-// 轮询），每条路径一个 recvLoop goroutine 解帧喂入共享重排缓冲；
+// 并发结构：一个 sendLoop goroutine 独占 DATA/ACK/PING/TELEMETRY
+// 帧写出（并承担周期 tick：TELEMETRY 回报、窗口容量重算、过期
+// 探测），每条路径一个 recvLoop goroutine 解帧喂入共享重排缓冲；
 // 应用侧 Read/Write 经 mu + chan 广播与两者同步，deadline 用
 // atomic + timer 实现，不依赖底层流的 SetDeadline（应用 deadline
 // 只约束本层阻塞，不传导到路径写，避免误触发摘除）。
-//
-// 选路点即调度器接缝：当前为轮询条带，最短排空时间优先调度器
-// （逐路径 est_rate/srtt/inflight）在 #20 落地——届时只替换
-// pickPathLocked 的决策，帧编码与写路径不变。
 type Stream struct {
 	id   [16]byte
 	agg  *Aggregator // 所属聚合器（PATH_ATTACH 路由表注册/反注册）；测试流为 nil
@@ -124,11 +120,12 @@ type Stream struct {
 	mu   sync.Mutex
 	rbuf reorderBuf
 
-	// 路径集合（mu 保护）：paths 为存活路径列表（轮询选路的遍历序），
-	// pathsByID 以 path_id 索引全部存活路径（PATH_DROP 查找用）。
+	// 路径集合（mu 保护）：paths 为存活路径列表（调度器候选集），
+	// pathsByID 以 path_id 索引全部存活路径（PATH_DROP 查找与
+	// ts_path/TELEMETRY 归属用）。
 	paths     []*path
 	pathsByID map[uint64]*path
-	rrNext    uint64 // 轮询游标（#20 换成调度器状态）
+	sched     scheduler // 分帧决策边界（#20，见 scheduler.go）
 	// path_id 分侧命名空间（规格 §4.3）：最低位标识分配侧
 	//（0=聚合流发起方，1=接收方），本侧计数器步长 2 保证两端
 	// 互不冲突；握手流升格的首条路径恒为发起方 id 0。
@@ -159,6 +156,7 @@ type Stream struct {
 
 	// 接收侧（mu 保护）
 	lastDataTs    uint64 // 最近收到的 DATA 帧发送时间戳（ACK 回显用）
+	lastDataPath  *path  // 最近收到的 DATA 帧所在路径（ACK ts_path 归属）
 	freedSinceAck int    // 自上次 ACK 以来 Read 释放的缓冲字节数
 	rerr          error  // 读侧终态：io.EOF=对端正常关闭；其它=传输错误
 	werr          error  // 写侧终态
@@ -205,12 +203,16 @@ func newStreamFull(id [16]byte, pc pathConn, cfg streamConfig, agg *Aggregator, 
 	if cfg.sendBufCap <= 0 {
 		cfg.sendBufCap = 2 * cfg.windowCap()
 	}
+	if cfg.telemetryInterval <= 0 {
+		cfg.telemetryInterval = defaultTelemetryInterval
+	}
 	s := &Stream{
 		id:           id,
 		agg:          agg,
 		peer:         remote,
 		cfg:          cfg,
 		base:         time.Now(),
+		sched:        minDrainScheduler{},
 		ackCh:        make(chan struct{}, 1),
 		sendWake:     make(chan struct{}, 1),
 		done:         make(chan struct{}),
@@ -222,7 +224,7 @@ func newStreamFull(id [16]byte, pc pathConn, cfg streamConfig, agg *Aggregator, 
 	s.rbuf = *newReorderBuf(cfg.windowCap())
 	// 首条路径 = 握手流升格，path_id 恒为发起方命名空间的 0，
 	// 两端视图一致（PATH_DROP 据此寻址）。
-	first := &path{id: 0, conn: pc, dialed: initiator}
+	first := &path{id: 0, conn: pc, dialed: initiator, attachedAt: s.base}
 	s.paths = []*path{first}
 	s.pathsByID = map[uint64]*path{0: first}
 	if initiator {
@@ -250,7 +252,7 @@ func (s *Stream) ID() [16]byte { return s.id }
 func (s *Stream) Peer() peer.ID { return s.peer }
 
 // sendTs 返回当前发送时间戳（相对 base 的微秒数，含单调钟）。
-// ACK 回显后发送端用它算 srtt（#20）；本票只负责携带。
+// DATA 帧携带、ACK 经 ts_echo 回显后发送端据此算逐路径 RTT（#20）。
 func (s *Stream) sendTs() uint64 {
 	d := time.Since(s.base)
 	if d < 0 {
@@ -301,16 +303,21 @@ func (s *Stream) Write(b []byte) (int, error) {
 }
 
 // sendLoop 发送泵：所有 DATA/ACK 帧写出都经此 goroutine，天然串行
-// 无交错。建流即通告初始窗口（对端收到前不发 DATA，防止超发被对端
+// 无交错；另承担周期 tick（TELEMETRY 回报、窗口容量重算、指标过期
+// 探测）。建流即通告初始窗口（对端收到前不发 DATA，防止超发被对端
 // 重排缓冲丢弃）。
 func (s *Stream) sendLoop() {
 	s.sendAck()
+	tick := time.NewTicker(s.cfg.telemetryInterval)
+	defer tick.Stop()
 	for {
 		select {
 		case <-s.done:
 			return
 		case <-s.ackCh:
 			s.sendAck()
+		case <-tick.C:
+			s.onTick()
 		case <-s.sendWake:
 			for s.trySend() {
 			}
@@ -318,17 +325,113 @@ func (s *Stream) sendLoop() {
 	}
 }
 
-// pickPathLocked 轮询选一条存活路径。调度器接缝（规格书 §5.1）：
-// #20 将替换为「最短排空时间优先」——按 (queued+len)/est_rate 选路，
-// 此处帧编码与写路径不变。调用方须持有 mu。
-func (s *Stream) pickPathLocked() *path {
-	n := len(s.paths)
-	if n == 0 {
-		return nil
+// onTick 是发送泵的周期任务（telemetryInterval 一拍）：
+//  1. 汇总本周期各路径收端到达速率 → TELEMETRY 回报对端（规格 §5.2；
+//     只报有新到达字节的路径，全静默则不占带宽）；
+//  2. 按 Σest_rate·max_srtt 重算收端窗口容量（规格 §6 窗口联动）；
+//  3. 对「指标失联且有发送需求」的路径发 PING 探测（规格 §5.2：
+//     主动探测仅限冷启动/过期/疑似降级，不常态化）。
+func (s *Stream) onTick() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
 	}
-	p := s.paths[int(s.rrNext%uint64(n))]
-	s.rrNext++
-	return p
+	now := time.Now()
+	var rates []*pb.PathRate
+	var toPing []*path
+	needSend := s.pendingBytes > 0 || len(s.unackedSegs) > 0
+	for _, p := range s.paths {
+		if p.rxMarkT.IsZero() {
+			p.rxMarkT = p.attachedAt
+		}
+		d := p.rxBytes - p.rxMark
+		dt := now.Sub(p.rxMarkT)
+		// 收端到达速率采样：攒够最小字节窗或最长时窗才出样本
+		// （离散帧到达在小窗口内会被量化成虚高速率）；样本进
+		// rxRate（窗口容量联动的输入），有实收才向对端回报。
+		if dt > 0 && (d >= rxSampleMinBytes || dt >= rxSampleMaxWindow) {
+			p.rxRate = filterRate(p.rxRate, float64(d)/dt.Seconds())
+			if d > 0 {
+				// 只报有新到达的路径：静默路径的旧观测让对端
+				// 靠 TTL 过期作废，不浪费带宽报零（规格 §5.2）。
+				rates = append(rates, &pb.PathRate{
+					PathId:  p.id,
+					RateBps: uint64(p.rxRate),
+				})
+			}
+			p.rxMark, p.rxMarkT = p.rxBytes, now
+		}
+		// 两种探测触发（规格 §5.2：仅冷启动/过期/疑似降级）：
+		//  a) 正在收数据却无 RTT 样本——收端窗口容量联动需要
+		//     srtt（Σrate·max_srtt），纯收端没有 ACK 回显可采，
+		//     用 PING 补齐。首条握手路径也靠它，不必建流即探；
+		//  b) 指标曾经有效但失联（est_rate 过期或 RTT 样本陈旧）
+		//     且有数据待发/在途——无需求时探测只会偷带宽。
+		probe := (p.rxBytes > 0 && !p.hasRTT) ||
+			(needSend && ((p.hasRate && now.Sub(p.lastRateAt) > p.staleAfter()) ||
+				(p.hasRTT && now.Sub(p.lastRTTAt) > rttStaleAfter)))
+		if probe && now.Sub(p.lastPingAt) > pingMinInterval {
+			p.lastPingAt = now
+			toPing = append(toPing, p)
+		}
+	}
+	s.updateWindowCapLocked()
+	s.mu.Unlock()
+
+	// 控制帧写出全部异步化：sendLoop 是 DATA/ACK 的唯一写者，
+	// 任何一条路径上的阻塞写（回压/底层滞留）都不许拖住泵——
+	// 否则 ACK 停发、窗口停滞，全局吞吐被一条慢路径绑架。
+	if len(rates) > 0 {
+		go s.sendTelemetry(rates)
+	}
+	for _, p := range toPing {
+		go s.sendPing(p, false, s.sendTs())
+	}
+}
+
+// updateWindowCapLocked 按规格书 §6 重算重排缓冲容量：
+//
+//	reorder_buf = clamp(Σ rate_i · max srtt_i, minBuf, maxBuf)
+//
+// 收端的 rate_i 用本端实测的各路径到达速率 rxRate（缓冲要承接的
+// 正是到达流量；send-only 方向上 rxRate≈0 → 容量退回下界，符合
+// 「缓冲跟随到达负载」的语义）；max srtt_i 取各路径 srtt 的最大值
+// （RFC 8684 §3.3.4 紧上界同构）。容量随路径增删与指标漂移联动；
+// 新容量直接反映在下一条 ACK 的窗口通告里，若窗口由 0 重开则
+// 立即补通告（发送端可能正停摆）。带滞回：与现容量差不足
+// minBuf/8 时不调整，防估计抖动引起窗口振荡。调用方须持有 mu。
+func (s *Stream) updateWindowCapLocked() {
+	var sumRate float64
+	var maxSRTT time.Duration
+	for _, p := range s.paths {
+		sumRate += p.rxRate
+		if p.srtt > maxSRTT {
+			maxSRTT = p.srtt
+		}
+	}
+	newCap := int(sumRate * maxSRTT.Seconds())
+	if newCap < s.cfg.minBuf {
+		newCap = s.cfg.minBuf
+	}
+	if newCap > s.cfg.maxBuf {
+		newCap = s.cfg.maxBuf
+	}
+	diff := newCap - s.rbuf.cap
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff < s.cfg.minBuf/8 {
+		return
+	}
+	prevWindow := s.rbuf.window()
+	s.rbuf.setCap(newCap)
+	// 发送缓冲随窗口容量同步伸缩，保持「sendBufCap = 2×窗口」
+	// 的不变量，保证窗口扩到多大发送端都有能力把它填满。
+	s.cfg.sendBufCap = 2 * newCap
+	if prevWindow <= 0 && s.rbuf.window() > 0 {
+		s.triggerAck()
+	}
 }
 
 // firstResendLocked 返回首个「路径已死、待换路重发」的 unacked 段
@@ -347,42 +450,28 @@ func (s *Stream) firstResendLocked() int {
 // trySend 发一帧 DATA；返回 false 表示暂无可发。
 // 优先级：死路径遗留段重发 > 新数据。重发不受窗口余量约束
 // （理由见下）；新数据仍须 unacked < 对端通告窗口。
+// 选路交给调度器（规格 §5.1 最短排空时间优先 + inflight 硬顶）：
+// 先确定本帧载荷再选路，帧长是排空时间的输入。
 func (s *Stream) trySend() bool {
 	s.mu.Lock()
 	if s.closed || s.werr != nil || !s.gotWindow {
 		s.mu.Unlock()
 		return false
 	}
-	p := s.pickPathLocked()
-	if p == nil {
-		s.mu.Unlock()
-		return false
-	}
 	var off uint64
 	var payload []byte
+	resendIdx := -1
 	if i := s.firstResendLocked(); i >= 0 {
 		// 死路径遗留段优先重发，且豁免窗口检查：这些字节区间本就
 		// 计入 unacked（窗口账本之内），对端要么已收（重排缓冲按
 		// 偏移去重丢弃）、要么正是它等不到的那块。若按窗口卡死，
 		// 「数据已送达但 ACK 随死路径丢失」会让发送端视角的窗口
 		// 被僵尸在途量占满——不重发即死锁。
+		resendIdx = i
 		rs := &s.unackedSegs[i]
 		n := int(min(uint64(len(rs.data)), uint64(maxFramePayload)))
 		off = rs.off
 		payload = rs.data[:n]
-		if n == len(rs.data) {
-			rs.path = p // 整段挂到新在途路径
-		} else {
-			// 段超单帧上限：已发部分立独立条目记在 p 名下，余量
-			// 留在原位（path 仍 nil）等下一轮——否则 p 再死时已发
-			// 部分无人记账，字节区间会永久失联
-			sent := sendSeg{off: rs.off, data: payload, path: p}
-			rs.off += uint64(n)
-			rs.data = rs.data[n:]
-			s.unackedSegs = append(s.unackedSegs, sendSeg{})
-			copy(s.unackedSegs[i+1:], s.unackedSegs[i:])
-			s.unackedSegs[i] = sent
-		}
 	} else {
 		// 新数据受窗口约束：unacked ≥ 对端通告窗口即停摆
 		// （uint64 计算防对端通告巨大值溢出）。
@@ -395,6 +484,35 @@ func (s *Stream) trySend() bool {
 		n := int(min(uint64(len(s.sendQ[0])-s.qHead), room, uint64(maxFramePayload)))
 		off = s.sentOff
 		payload = s.sendQ[0][s.qHead : s.qHead+n : s.qHead+n]
+	}
+	// 调度器分帧决策；返回 nil 表示全部路径在途顶满，本轮不发，
+	// 等 ACK 释放 inflight（或 TELEMETRY 校准）后 wakeSend 再试。
+	p := s.sched.pickData(s.paths, len(payload), time.Now())
+	if p == nil {
+		s.mu.Unlock()
+		return false
+	}
+	if resendIdx >= 0 {
+		rs := &s.unackedSegs[resendIdx]
+		if len(payload) == len(rs.data) {
+			rs.path = p // 整段挂到新在途路径
+		} else {
+			// 段超单帧上限：已发部分立独立条目记在 p 名下，余量
+			// 留在原位（path 仍 nil）等下一轮——否则 p 再死时已发
+			// 部分无人记账，字节区间会永久失联。
+			// 注意先插入后截断：append 可能整体搬移底层数组，
+			// 经 rs 直接改原段会写到旧数组上而丢失。
+			sent := sendSeg{off: rs.off, data: payload, path: p}
+			s.unackedSegs = append(s.unackedSegs, sendSeg{})
+			copy(s.unackedSegs[resendIdx+1:], s.unackedSegs[resendIdx:])
+			s.unackedSegs[resendIdx] = sent
+			rem := &s.unackedSegs[resendIdx+1]
+			rem.off += uint64(len(payload))
+			rem.data = rem.data[len(payload):]
+		}
+		p.inflight += len(payload)
+	} else {
+		n := len(payload)
 		s.qHead += n
 		if s.qHead == len(s.sendQ[0]) {
 			s.sendQ[0] = nil
@@ -404,6 +522,7 @@ func (s *Stream) trySend() bool {
 		s.sentOff += uint64(n)
 		s.pendingBytes -= n
 		s.unackedSegs = append(s.unackedSegs, sendSeg{off: off, data: payload, path: p})
+		p.inflight += n
 	}
 	ts := s.sendTs()
 	s.mu.Unlock()
@@ -421,10 +540,10 @@ func (s *Stream) trySend() bool {
 	return true
 }
 
-// sendAck 编码并经存活路径发出一条 ACK（规格 §4.4：优先走低延迟
-// 路径回送属 #20，本票复用轮询选路）：累积偏移 + SACK ranges +
-// 时间戳回显 + 当前接收窗口。字段取值时刻为编码时刻，因此重复的
-// 触发可安全合并（ackCh cap1 自然去抖）。
+// sendAck 编码并经存活路径发出一条 ACK：累积偏移 + SACK ranges +
+// 时间戳回显（含路径归属 ts_path）+ 当前接收窗口。回送路径由调度器
+// 选最低延迟者（规格 §4.4：ACK 优先走低延迟路径回送）。字段取值时刻
+// 为编码时刻，因此重复的触发可安全合并（ackCh cap1 自然去抖）。
 //
 // 写失败时换下一条存活路径重试：ACK 是累积快照，重发无害；若选中
 // 正在死亡的路径写完即丢（不重试则窗口重开通告可能永远到不了
@@ -438,18 +557,22 @@ func (s *Stream) sendAck() {
 		}
 		cum := s.rbuf.cum()
 		tsEcho := s.lastDataTs
+		var tsPath uint64 // 回显的路径归属：path_id+1（0=无有效回显）
+		if s.lastDataPath != nil {
+			tsPath = s.lastDataPath.id + 1
+		}
 		window := uint64(max(s.rbuf.window(), 0))
 		ranges := s.rbuf.ranges(maxAckRanges)
 		s.freedSinceAck = 0
 		seq := s.ackSeq
 		s.ackSeq++
-		p := s.pickPathLocked()
+		p := s.sched.pickAck(s.paths, time.Now())
 		s.mu.Unlock()
 		if p == nil {
 			return // 无存活路径：放弃本次 ACK，后续触发再试
 		}
 
-		buf := appendAckFrame(nil, cum, tsEcho, window, seq, ranges)
+		buf := appendAckFrame(nil, cum, tsEcho, tsPath, window, seq, ranges)
 		p.wmu.Lock()
 		_, err := p.conn.Write(buf)
 		p.wmu.Unlock()
@@ -472,7 +595,7 @@ func (s *Stream) sendPathDrop(id uint64) {
 		s.mu.Unlock()
 		return
 	}
-	p := s.pickPathLocked()
+	p := s.sched.pickAck(s.paths, time.Now())
 	s.mu.Unlock()
 	if p == nil {
 		return
@@ -483,6 +606,49 @@ func (s *Stream) sendPathDrop(id uint64) {
 	p.wmu.Unlock()
 	if err != nil {
 		// 连 PATH_DROP 都写不出 → 该路径一并摘除（级联深度 ≤ 路径数）
+		s.dropPath(p, err, true)
+	}
+}
+
+// sendPing 在指定路径上写一条 PING 帧（规格 §5.2 主动探测）。
+// reply=false 为主动探测（sendTs 取当前发送时刻）；reply=true 为
+// 应答，原样回显来方 send_ts——应答固定走同一路径返回，使测得的
+// RTT 天然归属该路径。尽力而为：写失败即摘除路径。
+func (s *Stream) sendPing(p *path, reply bool, sendTs uint64) {
+	body, err := proto.Marshal(&pb.Ping{SendTs: sendTs, Reply: reply})
+	if err != nil {
+		return
+	}
+	p.wmu.Lock()
+	_, err = p.conn.Write(appendCtrlFrame(nil, framePing, body))
+	p.wmu.Unlock()
+	if err != nil {
+		s.dropPath(p, err, true)
+	}
+}
+
+// sendTelemetry 把收端观测的各路径到达速率编码为 TELEMETRY 帧，
+// 经当前最低延迟路径发出（规格 §5.2：校准发送端 est_rate）。
+// 尽力而为不重试——丢一拍由下一周期刷新。
+func (s *Stream) sendTelemetry(rates []*pb.PathRate) {
+	body, err := proto.Marshal(&pb.Telemetry{Rates: rates})
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	p := s.sched.pickAck(s.paths, time.Now())
+	s.mu.Unlock()
+	if p == nil {
+		return
+	}
+	p.wmu.Lock()
+	_, err = p.conn.Write(appendCtrlFrame(nil, frameTelemetry, body))
+	p.wmu.Unlock()
+	if err != nil {
 		s.dropPath(p, err, true)
 	}
 }
@@ -508,6 +674,7 @@ func (s *Stream) dropPath(p *path, cause error, notify bool) {
 	delete(s.pathsByID, p.id)
 	for i := range s.unackedSegs {
 		if s.unackedSegs[i].path == p {
+			p.inflight -= len(s.unackedSegs[i].data) // 在途账本同步核销
 			s.unackedSegs[i].path = nil
 		}
 	}
@@ -604,6 +771,8 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 			s.mu.Lock()
 			s.rbuf.add(f.off, f.payload)
 			s.lastDataTs = f.sendTs
+			s.lastDataPath = p                  // ACK 回显的路径归属（ts_path）
+			p.rxBytes += uint64(len(f.payload)) // 收端到达速率记账（TELEMETRY）
 			// 纵深防御：诚实对端受窗口背压约束，size 恒 ≤ cap；
 			// 补洞段豁免容量检查意味着恶意对端可无视窗口灌有序
 			// 数据——占用超过 4×cap 即视为协议违例，直接 teardown
@@ -631,6 +800,16 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 			}
 			s.peerAckSeq = f.seq
 			s.gotPeerAck = true
+			now := time.Now()
+			// 逐路径 RTT 采样（#20，规格 §5.2）：ts_path 给出回显的
+			// 路径归属（被回显 DATA 到达对端所走的路径），样本喂给
+			// 正确路径。过期 ACK 已被上面的 seq 过滤丢弃，不会污染。
+			if f.tsPath != 0 && f.tsEcho != 0 {
+				if q := s.pathsByID[f.tsPath-1]; q != nil {
+					r := time.Duration(s.sendTs()-f.tsEcho) * time.Microsecond
+					q.noteRTT(r, now)
+				}
+			}
 			// 防御：对端不应确认未发送的字节；谎报时收敛到已发边界，
 			// 防 sentOff-cumAcked 下溢成天文数字
 			if f.cum > s.sentOff {
@@ -638,7 +817,7 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 			}
 			if f.cum > s.cumAcked {
 				s.cumAcked = f.cum
-				s.freeAckedLocked()
+				s.freeAckedLocked(now)
 			}
 			s.advWindow = f.window
 			s.gotWindow = true
@@ -648,6 +827,41 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 			s.wakeSend()
 		case framePathDrop:
 			s.handlePathDrop(f.body)
+		case framePing:
+			var pg pb.Ping
+			if err := proto.Unmarshal(f.body, &pg); err != nil {
+				continue // 帧体损坏：忽略，不致 teardown
+			}
+			if pg.GetReply() {
+				// 应答经同一路径返回：样本是本路径干净的双向 RTT
+				s.mu.Lock()
+				r := time.Duration(s.sendTs()-pg.GetSendTs()) * time.Microsecond
+				p.noteRTT(r, time.Now())
+				s.mu.Unlock()
+				continue
+			}
+			// 探测请求：在同路径上原样回显（调度之外，归属明确）。
+			// 异步写：同步传输上写会阻塞至对端开读，若两侧
+			// recvLoop 恰好同时各持写互不读便互锁——应答帧序
+			// 无关，挪出 recvLoop 保接收循环永不被写阻塞。
+			go s.sendPing(p, true, pg.GetSendTs())
+		case frameTelemetry:
+			var tm pb.Telemetry
+			if err := proto.Unmarshal(f.body, &tm); err != nil {
+				continue
+			}
+			// 收端观测速率是独立校准源（规格 §5.2）：对端视角的
+			// 到达速率不受本端 ACK 时序失真影响。
+			now := time.Now()
+			s.mu.Lock()
+			for _, r := range tm.GetRates() {
+				if q := s.pathsByID[r.GetPathId()]; q != nil {
+					q.peerRate = float64(r.GetRateBps())
+					q.peerRateAt = now
+				}
+			}
+			s.mu.Unlock()
+			s.wakeSend() // est_rate 可能被校准，重估调度
 		case framePathRequest:
 			// 中继路径按需协调（规格 §4.3）：异步向中继做 reservation
 			s.handlePathRequest(f.body)
@@ -668,25 +882,34 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 			return
 		default:
 			// PATH_ATTACH 只应出现在路径绑定子流首帧（聚合流上
-			// 收到即忽略）；PING/TELEMETRY 属 #20。
+			// 收到即忽略）；其余帧类型均已实现。
 		}
 	}
 }
 
-// freeAckedLocked 释放 cum 之前的发送缓冲（unackedSegs）。
-// cum 落在段中间时截段头（防御；正常情况下 cum 总落在帧边界上）。
-// 调用方须持有 mu。
-func (s *Stream) freeAckedLocked() {
+// freeAckedLocked 释放 cum 之前的发送缓冲（unackedSegs），并把
+// 新确认字节按段记账到其在途路径：inflight 核销 + delivery-rate
+// 采样（#20，BBR 式 est_rate 的数据源）。path=nil 的段（死路径
+// 遗留待重发）无路径可归，不产样本。cum 落在段中间时截段头
+// （防御；正常情况下 cum 总落在帧边界上）。调用方须持有 mu。
+func (s *Stream) freeAckedLocked(now time.Time) {
 	for len(s.unackedSegs) > 0 {
 		f := &s.unackedSegs[0]
 		end := f.off + uint64(len(f.data))
 		if end <= s.cumAcked {
+			if f.path != nil {
+				f.path.onDelivered(len(f.data), now)
+			}
 			s.unackedSegs[0] = sendSeg{}
 			s.unackedSegs = s.unackedSegs[1:]
 			continue
 		}
 		if f.off < s.cumAcked {
-			f.data = f.data[s.cumAcked-f.off:]
+			trim := s.cumAcked - f.off
+			if f.path != nil {
+				f.path.onDelivered(int(trim), now)
+			}
+			f.data = f.data[trim:]
 			f.off = s.cumAcked
 		}
 		break

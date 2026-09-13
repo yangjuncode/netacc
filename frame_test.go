@@ -41,7 +41,7 @@ func TestDataFrameRoundTrip(t *testing.T) {
 // TestAckFrameRoundTrip 验证 ACK 帧（累积偏移 + SACK ranges + 时间戳回显 + 窗口）往返一致。
 func TestAckFrameRoundTrip(t *testing.T) {
 	ranges := []byteRange{{100, 200}, {300, 350}, {1 << 40, 1<<40 + 999}}
-	buf := appendAckFrame(nil, 4096, 123456789, 65536, 7, ranges)
+	buf := appendAckFrame(nil, 4096, 123456789, 42, 65536, 7, ranges)
 	fr := newFrameReader(bytes.NewReader(buf))
 	ft, f, err := fr.next()
 	if err != nil {
@@ -50,8 +50,9 @@ func TestAckFrameRoundTrip(t *testing.T) {
 	if ft != frameAck {
 		t.Fatalf("帧类型应为 ACK，得到 %d", ft)
 	}
-	if f.cum != 4096 || f.tsEcho != 123456789 || f.window != 65536 || f.seq != 7 {
-		t.Fatalf("ACK 字段不一致: cum=%d tsEcho=%d window=%d seq=%d", f.cum, f.tsEcho, f.window, f.seq)
+	if f.cum != 4096 || f.tsEcho != 123456789 || f.tsPath != 42 || f.window != 65536 || f.seq != 7 {
+		t.Fatalf("ACK 字段不一致: cum=%d tsEcho=%d tsPath=%d window=%d seq=%d",
+			f.cum, f.tsEcho, f.tsPath, f.window, f.seq)
 	}
 	if len(f.ranges) != len(ranges) {
 		t.Fatalf("ranges 数不一致: %d != %d", len(f.ranges), len(ranges))
@@ -98,6 +99,7 @@ func TestFrameDecodeLimits(t *testing.T) {
 	hdr = appendUvarintField(hdr, uint64(frameAck))
 	hdr = appendUvarintField(hdr, 0) // cum
 	hdr = appendUvarintField(hdr, 0) // ts_echo
+	hdr = appendUvarintField(hdr, 0) // ts_path
 	hdr = appendUvarintField(hdr, 0) // window
 	hdr = appendUvarintField(hdr, 0) // seq
 	hdr = appendUvarintField(hdr, maxAckRanges+1)
@@ -123,7 +125,7 @@ func TestFrameDecodeLimits(t *testing.T) {
 func TestFrameReaderStream(t *testing.T) {
 	var buf bytes.Buffer
 	buf.Write(appendDataFrame(nil, 0, 11, []byte("hello")))
-	buf.Write(appendAckFrame(nil, 5, 11, 1024, 0, nil))
+	buf.Write(appendAckFrame(nil, 5, 11, 1, 1024, 0, nil))
 	buf.Write(appendCtrlFrame(nil, frameFin, nil))
 	fr := newFrameReader(&buf)
 

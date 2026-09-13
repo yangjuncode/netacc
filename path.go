@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/transport"
@@ -22,7 +23,8 @@ import (
 // 子流）。帧归属天然由子流承载，数据帧头不带 path_id（规格书 §4.4）。
 //
 // 并发约定：p.wmu 串行化该路径上的一切帧写出（发送泵的 DATA/ACK、
-// Close 的 FIN、摘除路径时的 PATH_DROP 互不交错）。
+// Close 的 FIN、摘除路径时的 PATH_DROP 互不交错）；指标字段一律由
+// 所属 Stream.mu 保护（采样/记账/调度都在 mu 下读写，见 scheduler.go）。
 type path struct {
 	id   uint64    // path_id（创建方命名空间，两端视图一致）
 	conn pathConn  // 底层子流：network.Stream 或直拨的 MuxedStream
@@ -31,6 +33,39 @@ type path struct {
 	dialed bool       // 本侧是否为该路径的发起方（拨号+attach 一侧）
 	wmu    sync.Mutex // 该路径的写串行化
 	dead   atomic.Bool
+
+	// ---- 以下为逐路径调度指标（#20，全部由所属 Stream.mu 保护）----
+	attachedAt time.Time // 挂接时刻（首个 delivery/rx 采样窗起点）
+
+	// RTT 采样（RFC 6298 EWMA + min_rtt；样本来自 ACK 的
+	// ts_echo/ts_path 回显与 PING 应答，见 noteRTT）
+	srtt      time.Duration // 平滑 RTT（含底层排队延迟）
+	rttvar    time.Duration // RTT 方差（#23 的 RTO 备用）
+	minRTT    time.Duration // 传播延迟基线
+	hasRTT    bool          // 是否有过有效 RTT 样本
+	lastRTTAt time.Time     // 最近 RTT 样本时刻（过期判定）
+
+	// BBR 式 delivery-rate 采样（见 onDelivered）
+	inflight   int       // 在途未确认字节数（调度器账本）
+	delivered  uint64    // 该路径累计被累积确认字节
+	estRate    float64   // 速率估计（字节/秒）
+	hasRate    bool      // 是否有过有效速率样本
+	rateMark   uint64    // 上次采样窗结束时 delivered 快照
+	lastRateAt time.Time // 上次速率样本时刻（est_rate 保鲜期判定）
+
+	// 对端 TELEMETRY 回报的收端观测速率（校准 est_rate，见 effRate）
+	peerRate   float64   // 字节/秒
+	peerRateAt time.Time // 最近一次回报时刻（TTL 判定）
+
+	// 收端方向记账：本端作为收端观测的该路径到达字节（TELEMETRY
+	// 周期换算成速率回报对端，并用作收端窗口容量联动的输入，
+	// 见 onTick / updateWindowCapLocked）
+	rxBytes uint64    // 累计到达字节
+	rxMark  uint64    // 上个回报周期结束时 rxBytes 快照
+	rxMarkT time.Time // 上个回报周期结束时刻
+	rxRate  float64   // 平滑后的到达速率估计（字节/秒）
+
+	lastPingAt time.Time // 上次主动 PING 时刻（节流）
 }
 
 // localAddr 返回本端地址（尽力而为：优先底层连接 multiaddr，退化 net.Addr）。
@@ -96,7 +131,7 @@ func (p *path) transport() PathTransport {
 }
 
 // PathInfo 是一条数据路径的观测快照（规格书 §8 Paths()）。
-// 逐路径 RTT/est_rate/inflight 指标属调度器（#20），此处先给身份与归属。
+// #20 起附逐路径调度指标只读快照，为 #25 的 Stats() 铺路。
 type PathInfo struct {
 	ID        uint64        // path_id（创建方命名空间，两端视图一致）
 	Dialed    bool          // 本侧是否为该路径的发起方
@@ -104,6 +139,12 @@ type PathInfo struct {
 	Transport PathTransport // 底层传输类型（规格书 §3.3，供 #20/#24 消费）
 	Local     net.Addr      // 本端地址（multiaddr 包装，取不到为 nil）
 	Remote    net.Addr      // 对端地址
+
+	// ---- 调度指标快照（无样本时为零值）----
+	SRTT     time.Duration // 平滑 RTT（含底层排队延迟）
+	MinRTT   time.Duration // 最小 RTT（传播延迟基线）
+	EstRate  float64       // 速率估计（字节/秒，含对端 TELEMETRY 校准）
+	Inflight int           // 当前在途未确认字节数
 }
 
 // ---------- PATH_ATTACH / PATH_DROP 帧体 ----------
@@ -139,6 +180,9 @@ func (s *Stream) attachPath(p *path, fr *frameReader) error {
 		s.mu.Unlock()
 		return net.ErrClosed
 	}
+	if p.attachedAt.IsZero() {
+		p.attachedAt = time.Now()
+	}
 	s.paths = append(s.paths, p)
 	s.pathsByID[p.id] = p
 	s.mu.Unlock()
@@ -146,7 +190,13 @@ func (s *Stream) attachPath(p *path, fr *frameReader) error {
 		fr = newFrameReader(p.conn)
 	}
 	go s.recvLoop(p, fr)
-	s.wakeSend() // 发送泵立刻把新路径纳入轮询
+	// 冷启动探测（规格书 §5.2）：新路径尚无 srtt/est_rate 样本，
+	// 一条 PING 让逐路径 RTT 先跑起来，不必等首个数据往返。
+	// 异步写：底层同步传输（如 net.Pipe）上写会阻塞至对端开读，
+	// attachPath 不能因此卡住调用方；PING 与 DATA 共用 wmu
+	// 串行化，先后次序不影响正确性。
+	go s.sendPing(p, false, s.sendTs())
+	s.wakeSend() // 发送泵立刻把新路径纳入调度
 	return nil
 }
 
@@ -264,6 +314,7 @@ func (s *Stream) RemovePath(pathID uint64) error {
 func (s *Stream) Paths() []PathInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	out := make([]PathInfo, 0, len(s.paths))
 	for _, p := range s.paths {
 		out = append(out, PathInfo{
@@ -273,6 +324,10 @@ func (s *Stream) Paths() []PathInfo {
 			Transport: p.transport(),
 			Local:     p.localAddr(),
 			Remote:    p.remoteAddr(),
+			SRTT:      p.srtt,
+			MinRTT:    p.minRTT,
+			EstRate:   p.effRate(now),
+			Inflight:  p.inflight,
 		})
 	}
 	return out

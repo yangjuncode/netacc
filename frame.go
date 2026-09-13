@@ -22,7 +22,7 @@ import (
 // 各类型线格式：
 //
 //	DATA(1):        type | offset | send_ts_us | payload_len | payload
-//	ACK(2):         type | cum_offset | ts_echo_us | window | seq | n_ranges | (start,end)*n
+//	ACK(2):         type | cum_offset | ts_echo_us | ts_path | window | seq | n_ranges | (start,end)*n
 //	控制/其它(3–10): type | body_len | protobuf_body
 //
 // 序号空间为字节级：offset/cum/ranges 都是载荷在聚合流内的绝对字节
@@ -67,6 +67,11 @@ type frame struct {
 
 	cum    uint64 // ACK：累积确认偏移（< cum 的字节均已按序收到）
 	tsEcho uint64 // ACK：触发本 ACK 的 DATA 帧时间戳回显
+	// tsPath 是 ts_echo 的路径归属：被回显 DATA 帧到达收端所走路径的
+	// path_id+1（0 表示无有效回显，即收端尚未收到任何 DATA）。
+	// 发送端据此把 RTT 样本喂给正确路径（#20：逐路径 srtt 采样——
+	// ACK 不带归属时无法区分回显的是哪条路径上发出的 DATA）。
+	tsPath uint64
 	window uint64 // ACK：接收窗口通告（重排缓冲剩余量）
 	seq    uint64 // ACK：发送端单调递增序号——多路径下 ACK 会
 	// 跨路径超车，接收端只应用 seq 递增的帧（last-writer-wins），
@@ -91,13 +96,15 @@ func appendDataFrame(dst []byte, off, sendTs uint64, payload []byte) []byte {
 
 // appendAckFrame 编码一帧 ACK。ranges 会被截断到 maxAckRanges。
 // seq 由发送端逐帧递增，供接收端丢弃跨路径超车的过期 ACK。
-func appendAckFrame(dst []byte, cum, tsEcho, window, seq uint64, ranges []byteRange) []byte {
+// tsPath 编码回显时间戳的路径归属（path_id+1，0=无回显）。
+func appendAckFrame(dst []byte, cum, tsEcho, tsPath, window, seq uint64, ranges []byteRange) []byte {
 	if len(ranges) > maxAckRanges {
 		ranges = ranges[:maxAckRanges]
 	}
 	dst = appendUvarintField(dst, uint64(frameAck))
 	dst = appendUvarintField(dst, cum)
 	dst = appendUvarintField(dst, tsEcho)
+	dst = appendUvarintField(dst, tsPath)
 	dst = appendUvarintField(dst, window)
 	dst = appendUvarintField(dst, seq)
 	dst = appendUvarintField(dst, uint64(len(ranges)))
@@ -172,6 +179,9 @@ func (r *frameReader) next() (frameType, frame, error) {
 		if f.tsEcho, err = r.uvarint("ACK.ts_echo"); err != nil {
 			return 0, f, err
 		}
+		if f.tsPath, err = r.uvarint("ACK.ts_path"); err != nil {
+			return 0, f, err
+		}
 		if f.window, err = r.uvarint("ACK.window"); err != nil {
 			return 0, f, err
 		}
@@ -201,8 +211,9 @@ func (r *frameReader) next() (frameType, frame, error) {
 		}
 	case framePathAttach, framePathDrop, framePathRequest, framePathReady,
 		framePing, frameTelemetry, frameFin, frameRst:
-		// 控制帧统一 body_len 定界；本票不解体内容（PATH_* 等留给 #19/#20，
-		// FIN/RST 的语义在 recvLoop 处理）。保留 body_len 字段以便未来
+		// 控制帧统一 body_len 定界；此处只解出原始 body，protobuf
+		// 体的解析在 recvLoop 按帧类型分发（PATH_* 见 #19，
+		// PING/TELEMETRY 见 #20）。保留 body_len 字段以便未来
 		// 在同一线格式上扩展控制帧体而不破坏定界。
 		n, err := r.uvarint("控制帧.body_len")
 		if err != nil {
