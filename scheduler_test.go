@@ -124,12 +124,12 @@ func TestPickAckLowestRTT(t *testing.T) {
 func TestNoteRTTEWMA(t *testing.T) {
 	now := time.Now()
 	p := &path{}
-	p.noteRTT(100*time.Millisecond, now)
+	p.noteRTT(100*time.Millisecond, now, 0)
 	if !p.hasRTT || p.srtt != 100*time.Millisecond ||
 		p.rttvar != 50*time.Millisecond || p.minRTT != 100*time.Millisecond {
 		t.Fatalf("首样本初始化错误: srtt=%v rttvar=%v min=%v", p.srtt, p.rttvar, p.minRTT)
 	}
-	p.noteRTT(50*time.Millisecond, now)
+	p.noteRTT(50*time.Millisecond, now, 0)
 	// RFC 6298：rttvar = 3/4·50 + 1/4·|100-50| = 50ms；
 	//           srtt = 7/8·100 + 1/8·50 = 93.75ms；min_rtt 取小
 	if p.srtt != 93750*time.Microsecond || p.rttvar != 50*time.Millisecond ||
@@ -137,7 +137,7 @@ func TestNoteRTTEWMA(t *testing.T) {
 		t.Fatalf("EWMA 错误: srtt=%v rttvar=%v min=%v", p.srtt, p.rttvar, p.minRTT)
 	}
 	// 负样本（时钟回拨/伪造回显）丢弃
-	p.noteRTT(-time.Millisecond, now)
+	p.noteRTT(-time.Millisecond, now, 0)
 	if p.srtt != 93750*time.Microsecond {
 		t.Fatal("负样本不应被采纳")
 	}

@@ -77,6 +77,34 @@ const (
 	rxSampleMaxWindow = time.Second
 )
 
+// 软失效判定与降权常量（规格 §5.3，#23）。
+const (
+	// suspectK 是可疑判据系数：路径在途段超过 k·srtt 未被 ACK/SACK
+	// 覆盖即标可疑。k=2 给单倍 RTT 抖动留一倍余量——一个 srtt 内的
+	// 迟到属正常，两个 srtt 仍无任何覆盖证据才视为掉队。
+	suspectK = 2
+
+	// suspectFloor 是可疑判据下界：loopback/短 RTT 路径上 srtt 极小，
+	// goroutine 调度抖动即可让在途段「超时」，无下界会把健康路径
+	// 反复误标。取默认 tick 周期同量级，给 ACK 回程留足调度余量。
+	suspectFloor = 200 * time.Millisecond
+
+	// pathRTOFloor 是路径 RTO 下界：可疑态持续超过
+	// max(srtt+4·rttvar, 本值) 仍无活性证据即按硬失效摘除
+	// （规格 §5.3「路径 RTO 到期才摘除」）。取 RFC 6298 的
+	// RTOmin=1s 同值：loopback/短 RTT 下公式值趋零，须靠下界
+	// 防瞬时抖动误摘；聚合场景单路径被摘不等于断流（在途数据
+	// 已换路兜住、路径可经 AddPath 重建），故不再像 TCP 那样
+	// 加倍退避。
+	pathRTOFloor = time.Second
+
+	// suspectPenalty 是可疑路径的调度降权系数：effRate 与
+	// inflightCap 均按 1/penalty 折算（MPTCP 可疑子流 cwnd/2
+	// 同构）。取 4 比 cwnd/2 更狠：我们的可疑信号比真丢包弱，
+	// 但误判代价也小——该路径只是少分新数据，在途段已换路兜住。
+	suspectPenalty = 4
+)
+
 // scheduler 是发送泵的分帧决策边界（规格书 §8：内部接口不公开）。
 // 实现只做无副作用的纯决策——路径指标只能由 stream 的采样/记账
 // 代码更新，调度器不写任何状态。调用方须持有 s.mu。
@@ -101,21 +129,41 @@ type scheduler interface {
 // 与内核版的差异：我们没有 per-path 发送队列——数据在选定路径后
 // 才从全局待发队列装帧，因此「排队量」用该路径在途未确认字节
 // inflight_i 表达（排干它≈其末尾字节到对端的剩余时间）。机会重发
-// + 惩罚、ECF 式等待判定分别为 #23 与后续增强项。
+// + 惩罚已由 #23 落地（可疑路径只做兜底 + effRate/cap 折算降权，
+// 见 pickData/pickMinDrain/inflightCap）。
 type minDrainScheduler struct{}
 
 // pickData 实现最短排空时间优先。同分确定性打破（避免抖动）：
 // inflight 少者优先，再并列取 path_id 小者。
+// 可疑路径（#23 软失效）只做兜底：第一趟在非可疑路径里选；
+// 全部可疑或全部顶满时第二趟才纳入，且速率按 1/suspectPenalty
+// 折算——降权是强偏好不是禁发，单路径/全可疑时仍须发得出
+// （同路径超时重发靠的就是这个兜底）。
 func (minDrainScheduler) pickData(paths []*path, frameLen int, now time.Time) *path {
+	if p := pickMinDrain(paths, frameLen, now, false); p != nil {
+		return p
+	}
+	return pickMinDrain(paths, frameLen, now, true)
+}
+
+// pickMinDrain 在候选集内做最短排空时间优先选择；includeSuspect
+// 为 false 时跳过可疑路径（第一趟）。
+func pickMinDrain(paths []*path, frameLen int, now time.Time, includeSuspect bool) *path {
 	var best *path
 	bestDrain := math.Inf(1)
 	for _, p := range paths {
+		if p.suspect && !includeSuspect {
+			continue
+		}
 		if int64(p.inflight) >= p.inflightCap(now) {
 			continue // 在途硬顶：本轮跳过该路径
 		}
 		rate := p.effRate(now)
 		if rate <= 0 {
 			rate = coldRateBps // 冷启动：名义速率参与 → 均等分摊
+		}
+		if p.suspect {
+			rate /= suspectPenalty
 		}
 		drain := float64(p.inflight+frameLen) / rate
 		if drain < bestDrain || (drain == bestDrain &&
@@ -129,12 +177,18 @@ func (minDrainScheduler) pickData(paths []*path, frameLen int, now time.Time) *p
 
 // pickAck 选 RTT 最小的路径回送控制帧；无 RTT 样本的路径排在
 // 有样本者之后，全部无样本时退化为取首条（控制帧必须发得出）。
+// 可疑路径排在非可疑者之后（#23）：其正向可能已在丢帧，控制帧
+// 写进去多半白丢，优先走仍能证实送达的路径。
 func (minDrainScheduler) pickAck(paths []*path, now time.Time) *path {
 	var best *path
 	for _, p := range paths {
 		switch {
 		case best == nil:
 			best = p
+		case p.suspect != best.suspect:
+			if !p.suspect {
+				best = p
+			}
 		case p.hasRTT && (!best.hasRTT || p.srtt < best.srtt):
 			best = p
 		}
@@ -155,7 +209,7 @@ func (minDrainScheduler) pickAck(paths []*path, now time.Time) *path {
 //
 // 跨路径重发不引入 Karn 歧义：ts_echo/ts_path 归属的是对端实际
 // 收到那份拷贝的发送时刻与路径，样本天然落在先到路径上。
-func (p *path) noteRTT(r time.Duration, now time.Time) {
+func (p *path) noteRTT(r time.Duration, now time.Time, echoTs uint64) {
 	if r < 0 {
 		return // 时钟回拨或伪造回显：丢弃（r=0 是合法的极速样本）
 	}
@@ -174,6 +228,14 @@ func (p *path) noteRTT(r time.Duration, now time.Time) {
 		}
 	}
 	p.lastRTTAt = now
+	// RTT 样本 = 该路径仍有往返能力的直接证据（#23：可疑态恢复
+	// 信号）。但只采信「标记之后发出」的帧产生的回显：echoTs 是
+	// 被回显 DATA/PING 的原始发送时刻（sendTs 域）——晚于
+	// suspectSinceTs 才证明路径在可疑之后仍完成了一次往返；
+	// 早于它的样本只是旧拷贝的在途回声，不能复活正在掉队的路径。
+	if echoTs > p.suspectSinceTs {
+		p.clearSuspectLocked()
+	}
 }
 
 // onDelivered 记账 n 字节在本路径上被对端累积确认：扣在途量，
@@ -181,8 +243,20 @@ func (p *path) noteRTT(r time.Duration, now time.Time) {
 // 采样间隔取 max(srtt, rateSampleFloor)（§5.2 每 srtt 一样本 +
 // 防微秒级 Δt 噪声）；窗口未满时交付量滚入下一窗。
 func (p *path) onDelivered(n int, now time.Time) {
-	p.delivered += uint64(n)
 	p.inflight -= n
+	p.creditDelivered(n, now)
+}
+
+// creditDelivered 只记交付量与速率样本，不动 inflight——SACK
+// 覆盖的段在被标 sacked 时已释放 inflight（字节已躺在对端重排
+// 缓冲、不在路上；若等 cum 才释放，已送达字节会把路径在途量钉死
+// 在硬顶，堵住真正待补的洞——环形死锁），cum 推进释放时只补记
+// 交付量。注意它不清 suspect：cum 覆盖只说明「对端有这些字节」，
+// 字节可能早前送达或经他路重发到位，不含路径新鲜度证据——可疑态
+// 只能由新鲜的逐路径证据解除（noteRTT 的新 RTT 样本、新 SACK
+// 覆盖名下段，见 checkSoftFailLocked）。
+func (p *path) creditDelivered(n int, now time.Time) {
+	p.delivered += uint64(n)
 	if p.lastRateAt.IsZero() {
 		// 首个采样窗从路径挂接起算
 		p.lastRateAt = p.attachedAt
@@ -260,8 +334,14 @@ func (p *path) effRate(now time.Time) float64 {
 // cap ≈ k·BDP 才是在途量上限的本意，BDP 用带宽×传播基线。
 // 指标缺失时取下界 minInflightCap，保证冷启动/慢路径至少能流水线
 // 两个满帧（防 cap=0 死锁，也给慢路径留可被观测的在途量）。
+// 可疑路径速率同按 1/suspectPenalty 折算——降权的另一条腿
+// （#23：cap 收缩直接限制其继续堆积）。
 func (p *path) inflightCap(now time.Time) int64 {
-	cap := int64(inflightCapK * p.effRate(now) * p.minRTT.Seconds())
+	rate := p.effRate(now)
+	if p.suspect {
+		rate /= suspectPenalty
+	}
+	cap := int64(inflightCapK * rate * p.minRTT.Seconds())
 	if cap < minInflightCap {
 		return minInflightCap
 	}
