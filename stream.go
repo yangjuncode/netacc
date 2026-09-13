@@ -137,6 +137,13 @@ type Stream struct {
 	seenRemote   map[uint64]struct{} // 对端曾用过的 path_id（含已死：重加须换新 id）
 	finRecv      bool                // 任一路径上收到过 FIN（对端正常关闭）
 
+	// 中继路径按需协调（规格书 §4.3，#21，均 mu 保护）：
+	// 本侧发出的 PATH_REQUEST 在 pendingRelay 里等 PATH_READY；
+	// 对端发来的 PATH_REQUEST 触发本侧向中继做 reservation（rsvInFlight 计数限流）。
+	nextRelayReqID uint64                // 本侧 PATH_REQUEST 的 request_id 计数
+	pendingRelay   map[uint64]chan error // request_id → PATH_READY 应答通道
+	rsvInFlight    int                   // 正为对端执行的 reservation 数
+
 	// 发送侧（mu 保护）
 	sendQ        [][]byte  // 待发队列（应用已写、尚未装帧）
 	qHead        int       // sendQ[0] 内已消费的偏移
@@ -199,17 +206,18 @@ func newStreamFull(id [16]byte, pc pathConn, cfg streamConfig, agg *Aggregator, 
 		cfg.sendBufCap = 2 * cfg.windowCap()
 	}
 	s := &Stream{
-		id:         id,
-		agg:        agg,
-		peer:       remote,
-		cfg:        cfg,
-		base:       time.Now(),
-		ackCh:      make(chan struct{}, 1),
-		sendWake:   make(chan struct{}, 1),
-		done:       make(chan struct{}),
-		rChange:    make(chan struct{}),
-		wChange:    make(chan struct{}),
-		seenRemote: make(map[uint64]struct{}),
+		id:           id,
+		agg:          agg,
+		peer:         remote,
+		cfg:          cfg,
+		base:         time.Now(),
+		ackCh:        make(chan struct{}, 1),
+		sendWake:     make(chan struct{}, 1),
+		done:         make(chan struct{}),
+		rChange:      make(chan struct{}),
+		wChange:      make(chan struct{}),
+		seenRemote:   make(map[uint64]struct{}),
+		pendingRelay: make(map[uint64]chan error),
 	}
 	s.rbuf = *newReorderBuf(cfg.windowCap())
 	// 首条路径 = 握手流升格，path_id 恒为发起方命名空间的 0，
@@ -640,6 +648,11 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 			s.wakeSend()
 		case framePathDrop:
 			s.handlePathDrop(f.body)
+		case framePathRequest:
+			// 中继路径按需协调（规格 §4.3）：异步向中继做 reservation
+			s.handlePathRequest(f.body)
+		case framePathReady:
+			s.handlePathReady(f.body)
 		case frameFin:
 			// FIN 属全流语义：只记「对端已正常关闭」，EOF 待全部
 			// 路径收场后统一落地——多路径下其它路径上可能还有
@@ -655,8 +668,7 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 			return
 		default:
 			// PATH_ATTACH 只应出现在路径绑定子流首帧（聚合流上
-			// 收到即忽略）；PATH_REQUEST/PATH_READY 属 #21，
-			// PING/TELEMETRY 属 #20。
+			// 收到即忽略）；PING/TELEMETRY 属 #20。
 		}
 	}
 }

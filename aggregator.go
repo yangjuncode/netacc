@@ -4,7 +4,9 @@
 //
 // 数据面帧结构（DATA/ACK + 重排缓冲 + 聚合窗口流控）由 #18 落地，
 // 见 stream.go / frame.go / reorder.go；多路径接入（PATH_ATTACH +
-// 对称加路径 + 轮询条带）由 #19 落地，见 path.go；调度器在 #20。
+// 对称加路径 + 轮询条带）由 #19 落地，见 path.go；中继路径按需协调
+// （PATH_REQUEST → reservation → PATH_READY → CONNECT）由 #21 落地，
+// 见 relaypath.go；调度器在 #20。
 package netacc
 
 import (
@@ -239,14 +241,13 @@ func (a *Aggregator) unregister(id [16]byte, st *Stream) {
 // 且会轮换，地址过期属预期，调用方喂新地址重试即可。
 func (a *Aggregator) dialDirect(ctx context.Context, p peer.ID, addr ma.Multiaddr) (transport.CapableConn, error) {
 	// 容忍 addr 带 /p2p/<peerID> 后缀：剥掉再匹配传输
+	// （电路地址 <relay>/p2p/<relay>/p2p-circuit/p2p/<dest> 同样只剥
+	// 尾部一段，余下的 /p2p-circuit 地址按 isRelayAddr 命中 circuit
+	// transport——circuit transport 就在 TransportForDialing 覆盖内）
 	if pid, err := peer.IDFromP2PAddr(addr); err == nil && pid != "" {
 		addr, _ = ma.SplitLast(addr)
 	}
-	sw, ok := a.host.Network().(*swarm.Swarm)
-	if !ok {
-		return nil, errors.New("netacc: 底层 Network 不是 *swarm.Swarm，无法直拨")
-	}
-	tpt := sw.TransportForDialing(addr)
+	tpt := a.transportForDialing(addr)
 	if tpt == nil {
 		return nil, fmt.Errorf("netacc: 没有能拨 %s 的传输", addr)
 	}
@@ -261,6 +262,15 @@ func (a *Aggregator) dialDirect(ctx context.Context, p peer.ID, addr ma.Multiadd
 		return nil, fmt.Errorf("netacc: 直拨 %s 的对端 %s 不是目标 peer %s", addr, cc.RemotePeer(), p)
 	}
 	return cc, nil
+}
+
+// transportForDialing 返回能拨 addr 的传输；底层不是 swarm 时为 nil。
+func (a *Aggregator) transportForDialing(addr ma.Multiaddr) transport.Transport {
+	sw, ok := a.host.Network().(*swarm.Swarm)
+	if !ok {
+		return nil
+	}
+	return sw.TransportForDialing(addr)
 }
 
 // OpenStream 向 peer 发起一条聚合流：在已有连接上开 /netacc/agg/1.0.0
