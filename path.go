@@ -6,13 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/transport"
-	msmux "github.com/multiformats/go-multistream"
 	ma "github.com/multiformats/go-multiaddr"
 	"google.golang.org/protobuf/proto"
 
@@ -25,11 +24,11 @@ import (
 // 并发约定：p.wmu 串行化该路径上的一切帧写出（发送泵的 DATA/ACK、
 // Close 的 FIN、摘除路径时的 PATH_DROP 互不交错）。
 type path struct {
-	id     uint64   // path_id（创建方命名空间，两端视图一致）
-	conn   pathConn // 底层子流：network.Stream 或直拨的 MuxedStream
-	own    io.Closer // 直拨出的底层连接（swarm 托管连接/管道为 nil）：
+	id   uint64    // path_id（创建方命名空间，两端视图一致）
+	conn pathConn  // 底层子流：network.Stream 或直拨的 MuxedStream
+	own  io.Closer // 直拨出的底层连接（swarm 托管连接/管道为 nil）：
 	// 直拨连接不进 swarm 连接表，必须随路径显式关闭，否则 conn 泄漏
-	dialed bool        // 本侧是否为该路径的发起方（拨号+attach 一侧）
+	dialed bool       // 本侧是否为该路径的发起方（拨号+attach 一侧）
 	wmu    sync.Mutex // 该路径的写串行化
 	dead   atomic.Bool
 }
@@ -64,13 +63,18 @@ func (p *path) remoteAddr() net.Addr {
 
 // connID 返回底层连接标识，用于区分「同 peer 多连接」的归属
 // （规格书 §3.2/验收：stream.Conn() 正确归属路径）。swarm 托管子流取
-// Conn().ID()；直拨连接不在 swarm 表内，用其远端 multiaddr 代替。
+// Conn().ID()；直拨连接不在 swarm 表内，用其远端 multiaddr 代替，
+// 中继电路连接另加 relay: 前缀便于与直连区分。
 func (p *path) connID() string {
 	if ns, ok := p.conn.(network.Stream); ok {
 		return ns.Conn().ID()
 	}
 	if cc, ok := p.own.(transport.CapableConn); ok {
-		return "direct:" + cc.RemoteMultiaddr().String()
+		raddr := cc.RemoteMultiaddr().String()
+		if strings.Contains(raddr, "/p2p-circuit") {
+			return "relay:" + raddr
+		}
+		return "direct:" + raddr
 	}
 	return ""
 }
@@ -78,11 +82,11 @@ func (p *path) connID() string {
 // PathInfo 是一条数据路径的观测快照（规格书 §8 Paths()）。
 // 逐路径 RTT/est_rate/inflight 指标属调度器（#20），此处先给身份与归属。
 type PathInfo struct {
-	ID      uint64   // path_id（创建方命名空间，两端视图一致）
-	Dialed  bool     // 本侧是否为该路径的发起方
-	ConnID  string   // 底层连接标识（同 peer 多连接并存时的归属判据）
-	Local   net.Addr // 本端地址（multiaddr 包装，取不到为 nil）
-	Remote  net.Addr // 对端地址
+	ID     uint64   // path_id（创建方命名空间，两端视图一致）
+	Dialed bool     // 本侧是否为该路径的发起方
+	ConnID string   // 底层连接标识（同 peer 多连接并存时的归属判据）
+	Local  net.Addr // 本端地址（multiaddr 包装，取不到为 nil）
+	Remote net.Addr // 对端地址
 }
 
 // ---------- PATH_ATTACH / PATH_DROP 帧体 ----------
@@ -157,44 +161,8 @@ func (s *Stream) AddPath(ctx context.Context, addr ma.Multiaddr) (uint64, error)
 		return 0, err
 	}
 	// 从这里起任何失败都必须 cc.Close()：直拨连接不进 swarm 连接表
-	ms, err := cc.OpenStream(ctx)
-	if err != nil {
-		_ = cc.Close()
-		return 0, fmt.Errorf("netacc: 直拨连接上开子流失败: %w", err)
-	}
-	// CapableConn.OpenStream 不做 multistream 协商，必须手动跑
-	// SelectProtoOrFail（原型 #13 实测：不协商对端 reset 0x1001）
-	if err := msmux.SelectProtoOrFail(PathProtocolID, ms); err != nil {
-		_ = cc.Close()
-		return 0, fmt.Errorf("netacc: 协商 %s 失败: %w", PathProtocolID, err)
-	}
-
-	// 绑定握手受 ctx/握手超时约束：deadline 传导到子流 + 看守兜底 reset
-	hsCtx, cancel := s.agg.handshakeCtx(ctx)
-	defer cancel()
-	stop := watchStreamCtx(ms, hsCtx)
-	defer stop()
-	if d, ok := hsCtx.Deadline(); ok {
-		_ = ms.SetDeadline(d)
-		defer ms.SetDeadline(time.Time{}) // 握手结束归还无限期路径
-	}
-	if err := s.sendPathAttach(ms, pathID); err != nil {
-		_ = cc.Close()
-		return 0, err
-	}
-	// 等对端回显同一 PATH_ATTACH 帧表示接受；对端不认识
-	// agg_stream_id 或拒绝 path_id 时直接 reset 子流
-	fr := newFrameReader(ms)
-	if err := s.recvPathAttachAck(fr, pathID); err != nil {
-		_ = cc.Close()
-		return 0, err
-	}
-	if err := ctx.Err(); err != nil {
-		_ = cc.Close()
-		return 0, err
-	}
-	if err := s.attachPath(&path{id: pathID, conn: ms, own: cc, dialed: true}, fr); err != nil {
-		_ = cc.Close()
+	// （绑定握手细节与中继电路路径共用，见 attachDialedConn）
+	if err := s.attachDialedConn(ctx, cc, pathID); err != nil {
 		return 0, err
 	}
 	return pathID, nil
