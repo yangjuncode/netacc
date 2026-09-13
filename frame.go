@@ -22,7 +22,7 @@ import (
 // 各类型线格式：
 //
 //	DATA(1):        type | offset | send_ts_us | payload_len | payload
-//	ACK(2):         type | cum_offset | ts_echo_us | window | n_ranges | (start,end)*n
+//	ACK(2):         type | cum_offset | ts_echo_us | window | seq | n_ranges | (start,end)*n
 //	控制/其它(3–10): type | body_len | protobuf_body
 //
 // 序号空间为字节级：offset/cum/ranges 都是载荷在聚合流内的绝对字节
@@ -65,9 +65,12 @@ type frame struct {
 	sendTs  uint64 // DATA：发送时间戳（微秒，发送端本地基准）
 	payload []byte // DATA：载荷
 
-	cum    uint64      // ACK：累积确认偏移（< cum 的字节均已按序收到）
-	tsEcho uint64      // ACK：触发本 ACK 的 DATA 帧时间戳回显
-	window uint64      // ACK：接收窗口通告（重排缓冲剩余量）
+	cum    uint64 // ACK：累积确认偏移（< cum 的字节均已按序收到）
+	tsEcho uint64 // ACK：触发本 ACK 的 DATA 帧时间戳回显
+	window uint64 // ACK：接收窗口通告（重排缓冲剩余量）
+	seq    uint64 // ACK：发送端单调递增序号——多路径下 ACK 会
+	// 跨路径超车，接收端只应用 seq 递增的帧（last-writer-wins），
+	// 否则晚到的旧 ACK 会把通告窗口覆盖回过期值造成死锁
 	ranges []byteRange // ACK：乱序已收区间（SACK）
 
 	body []byte // 控制帧：protobuf 体（本票不解析）
@@ -87,7 +90,8 @@ func appendDataFrame(dst []byte, off, sendTs uint64, payload []byte) []byte {
 }
 
 // appendAckFrame 编码一帧 ACK。ranges 会被截断到 maxAckRanges。
-func appendAckFrame(dst []byte, cum, tsEcho, window uint64, ranges []byteRange) []byte {
+// seq 由发送端逐帧递增，供接收端丢弃跨路径超车的过期 ACK。
+func appendAckFrame(dst []byte, cum, tsEcho, window, seq uint64, ranges []byteRange) []byte {
 	if len(ranges) > maxAckRanges {
 		ranges = ranges[:maxAckRanges]
 	}
@@ -95,6 +99,7 @@ func appendAckFrame(dst []byte, cum, tsEcho, window uint64, ranges []byteRange) 
 	dst = appendUvarintField(dst, cum)
 	dst = appendUvarintField(dst, tsEcho)
 	dst = appendUvarintField(dst, window)
+	dst = appendUvarintField(dst, seq)
 	dst = appendUvarintField(dst, uint64(len(ranges)))
 	for _, r := range ranges {
 		dst = appendUvarintField(dst, r.start)
@@ -168,6 +173,9 @@ func (r *frameReader) next() (frameType, frame, error) {
 			return 0, f, err
 		}
 		if f.window, err = r.uvarint("ACK.window"); err != nil {
+			return 0, f, err
+		}
+		if f.seq, err = r.uvarint("ACK.seq"); err != nil {
 			return 0, f, err
 		}
 		nr, err := r.uvarint("ACK.n_ranges")

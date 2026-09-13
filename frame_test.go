@@ -41,7 +41,7 @@ func TestDataFrameRoundTrip(t *testing.T) {
 // TestAckFrameRoundTrip 验证 ACK 帧（累积偏移 + SACK ranges + 时间戳回显 + 窗口）往返一致。
 func TestAckFrameRoundTrip(t *testing.T) {
 	ranges := []byteRange{{100, 200}, {300, 350}, {1 << 40, 1<<40 + 999}}
-	buf := appendAckFrame(nil, 4096, 123456789, 65536, ranges)
+	buf := appendAckFrame(nil, 4096, 123456789, 65536, 7, ranges)
 	fr := newFrameReader(bytes.NewReader(buf))
 	ft, f, err := fr.next()
 	if err != nil {
@@ -50,8 +50,8 @@ func TestAckFrameRoundTrip(t *testing.T) {
 	if ft != frameAck {
 		t.Fatalf("帧类型应为 ACK，得到 %d", ft)
 	}
-	if f.cum != 4096 || f.tsEcho != 123456789 || f.window != 65536 {
-		t.Fatalf("ACK 字段不一致: cum=%d tsEcho=%d window=%d", f.cum, f.tsEcho, f.window)
+	if f.cum != 4096 || f.tsEcho != 123456789 || f.window != 65536 || f.seq != 7 {
+		t.Fatalf("ACK 字段不一致: cum=%d tsEcho=%d window=%d seq=%d", f.cum, f.tsEcho, f.window, f.seq)
 	}
 	if len(f.ranges) != len(ranges) {
 		t.Fatalf("ranges 数不一致: %d != %d", len(f.ranges), len(ranges))
@@ -99,6 +99,7 @@ func TestFrameDecodeLimits(t *testing.T) {
 	hdr = appendUvarintField(hdr, 0) // cum
 	hdr = appendUvarintField(hdr, 0) // ts_echo
 	hdr = appendUvarintField(hdr, 0) // window
+	hdr = appendUvarintField(hdr, 0) // seq
 	hdr = appendUvarintField(hdr, maxAckRanges+1)
 	fr = newFrameReader(bytes.NewReader(hdr))
 	if _, _, err := fr.next(); err == nil {
@@ -122,7 +123,7 @@ func TestFrameDecodeLimits(t *testing.T) {
 func TestFrameReaderStream(t *testing.T) {
 	var buf bytes.Buffer
 	buf.Write(appendDataFrame(nil, 0, 11, []byte("hello")))
-	buf.Write(appendAckFrame(nil, 5, 11, 1024, nil))
+	buf.Write(appendAckFrame(nil, 5, 11, 1024, 0, nil))
 	buf.Write(appendCtrlFrame(nil, frameFin, nil))
 	fr := newFrameReader(&buf)
 
@@ -131,7 +132,7 @@ func TestFrameReaderStream(t *testing.T) {
 		t.Fatalf("第 1 帧错误: ft=%d err=%v", ft, err)
 	}
 	ft, f, err = fr.next()
-	if err != nil || ft != frameAck || f.cum != 5 || f.tsEcho != 11 || f.window != 1024 {
+	if err != nil || ft != frameAck || f.cum != 5 || f.tsEcho != 11 || f.window != 1024 || f.seq != 0 {
 		t.Fatalf("第 2 帧错误: ft=%d f=%+v err=%v", ft, f, err)
 	}
 	ft, _, err = fr.next()
