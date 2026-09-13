@@ -203,15 +203,15 @@ func TestStaleAckDropped(t *testing.T) {
 
 	// 注入新 ACK（seq=9，窗口大）再注入旧 ACK（seq=3，窗口 0）——
 	// 模拟旧帧在慢路径上晚到
-	if _, err := c2.Write(appendAckFrame(nil, 0, 0, 16384, 9, nil)); err != nil {
+	if _, err := c2.Write(appendAckFrame(nil, 0, 0, 0, 16384, 9, nil)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c2.Write(appendAckFrame(nil, 0, 0, 0, 3, nil)); err != nil {
+	if _, err := c2.Write(appendAckFrame(nil, 0, 0, 0, 0, 3, nil)); err != nil {
 		t.Fatal(err)
 	}
 	// 等两帧都被处理：用第三轮合法 ACK(seq=10) 做栅栏——它必然在
 	// 前两帧之后被应用
-	if _, err := c2.Write(appendAckFrame(nil, 0, 0, 8192, 10, nil)); err != nil {
+	if _, err := c2.Write(appendAckFrame(nil, 0, 0, 0, 8192, 10, nil)); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)

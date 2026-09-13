@@ -43,3 +43,33 @@ message PathDrop {
   // 待摘除路径的 path_id（即 PATH_ATTACH 时加路径方分配的标识）。
   uint64 path_id = 1;
 }
+
+// Ping 是 PING 帧（帧类型 7）的 protobuf 帧体：逐路径主动探测
+// （规格书 §5.2：仅用于冷启动、est_rate 过期、疑似降级，不常态化）。
+//
+// 发起方置 reply=false 携带 send_ts；接收方在同一条路径上原样回显
+// send_ts 并置 reply=true——应答固定走同路径返回，使测得的往返时延
+// 天然归属该路径（区别于 ACK 回显的「正向路径+回程最快路径」混合样本，
+// PING 样本是干净的单路径双向 RTT）。
+message Ping {
+  // 发送时间戳：微秒，与 DATA 帧 send_ts 同一基准（相对建流时刻）。
+  uint64 send_ts = 1;
+  // false=探测请求；true=对探测的应答回显。
+  bool reply = 2;
+}
+
+// Telemetry 是 TELEMETRY 帧（帧类型 8）的 protobuf 帧体：收端周期
+// 回报其观测到的各路径到达速率，供发送端校准 est_rate
+// （规格书 §5.2：对端视角的到达速率比发端 ACK 自测更准）。
+message Telemetry {
+  // 逐路径观测项；只包含有新到达字节的路径。
+  repeated PathRate rates = 1;
+}
+
+// PathRate 是一条路径的收端观测速率。
+message PathRate {
+  // 路径标识：PATH_ATTACH 时分配的 path_id，两端视图一致。
+  uint64 path_id = 1;
+  // 收端在上个回报周期内观测到的该路径到达速率（字节/秒）。
+  uint64 rate_bps = 2;
+}
