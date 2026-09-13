@@ -6,6 +6,7 @@ require (
 	github.com/libp2p/go-libp2p v0.49.0
 	github.com/libp2p/go-msgio v0.3.0
 	github.com/multiformats/go-multiaddr v0.16.1
+	golang.org/x/time v0.15.0
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -89,7 +90,6 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260717140457-bdb89881bb75 // indirect
 	golang.org/x/text v0.40.0 // indirect
-	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
