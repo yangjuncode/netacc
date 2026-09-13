@@ -6,7 +6,8 @@
 // 见 stream.go / frame.go / reorder.go；多路径接入（PATH_ATTACH +
 // 对称加路径 + 轮询条带）由 #19 落地，见 path.go；中继路径按需协调
 // （PATH_REQUEST → reservation → PATH_READY → CONNECT）由 #21 落地，
-// 见 relaypath.go；调度器在 #20。
+// 见 relaypath.go；调度器在 #20（scheduler.go）；路径策略层（内建
+// 自动策略 + 可插拔钩子）在 #24，见 policy.go。
 package netacc
 
 import (
@@ -54,6 +55,9 @@ type options struct {
 	// reorderMin / reorderMax：收端重排缓冲（连接级接收窗口）下界与硬顶，
 	// 容量 = clamp(Σest_rate·maxRTT, min, max)（规格书 §6）。
 	reorderMin, reorderMax int
+	// policy：聚合流默认路径策略（#24，规格书 §8 可插拔钩子）。
+	// nil = 关闭自动化；默认见 New（DefaultPolicy()）。
+	policy Policy
 }
 
 // WithAcceptBacklog 设置等待 Accept 的入向握手流排队长度（默认 16）。
@@ -86,6 +90,9 @@ type OpenOption func(*openOptions)
 type openOptions struct {
 	// minPaths：OpenStream 的成功门槛——至少 n 条数据路径 attached（规格书 §8）。
 	minPaths int
+	// policy：该条流的策略覆盖（WithStreamPolicy）；未给时沿用
+	// Aggregator 默认（OpenStream 里先填 a.opts.policy 再套选项）。
+	policy Policy
 }
 
 // WithMinPaths 要求聚合流至少挂接 n 条数据路径才算建立成功（规格书 §8）。
@@ -122,6 +129,11 @@ type Aggregator struct {
 // 仅 TCP+WebSocket（其余传输不支持 PSK）。自定义传输集时把想要
 // 的传输用 libp2p.Transport(...) 注册进 host 即可，本库无需额外
 // 配置。
+//
+// 路径策略（#24）：每条聚合流默认启用内建自动策略（实测供给不足时
+// 按 §3.3 偏好补直连路径、保守摘除垫底冗余路径）；WithPolicy 替换、
+// WithPolicy(nil) 关闭，OpenStream 可经 WithStreamPolicy 逐调用覆盖；
+// 手动 AddPath/RemovePath/AddRelayPath 与策略并存。
 func New(h host.Host, opts ...Option) *Aggregator {
 	a := &Aggregator{
 		host: h,
@@ -130,6 +142,10 @@ func New(h host.Host, opts ...Option) *Aggregator {
 			handshakeTimeout: defaultHandshakeTimeout,
 			reorderMin:       defaultMinReorderBuf,
 			reorderMax:       defaultMaxReorderBuf,
+			// 默认开启内建自动策略（决策票 #12 未定默认开关——取
+			// 「默认开但可关」：规格 §8 将其列为内建能力，关闭须
+			// 显式 WithPolicy(nil)）。
+			policy: DefaultPolicy(),
 		},
 		streams: make(map[[16]byte]*Stream),
 	}
@@ -283,7 +299,7 @@ func (a *Aggregator) OpenStream(ctx context.Context, p peer.ID, opts ...OpenOpti
 	if a.closed.Load() {
 		return nil, ErrClosed
 	}
-	oo := openOptions{minPaths: 1}
+	oo := openOptions{minPaths: 1, policy: a.opts.policy}
 	for _, opt := range opts {
 		opt(&oo)
 	}
@@ -310,7 +326,9 @@ func (a *Aggregator) OpenStream(ctx context.Context, p peer.ID, opts ...OpenOpti
 		_ = s.Reset()
 		return nil, err
 	}
-	st := newStreamFull(id, s, a.streamCfg(), a, p, true)
+	cfg := a.streamCfg()
+	cfg.policy = oo.policy
+	st := newStreamFull(id, s, cfg, a, p, true)
 	// 先注册再 start：对端收到 HelloAck 后即可反向 PATH_ATTACH 过来，
 	// 注册须先于「对端能感知本流存在」的任何信号。
 	a.register(st)
@@ -355,9 +373,9 @@ func (s *Stream) attachMinPaths(ctx context.Context, n int) error {
 	return nil
 }
 
-// streamCfg 把 Aggregator 选项落到聚合流数据面参数。
+// streamCfg 把 Aggregator 选项落到聚合流参数。
 func (a *Aggregator) streamCfg() streamConfig {
-	return streamConfig{minBuf: a.opts.reorderMin, maxBuf: a.opts.reorderMax}
+	return streamConfig{minBuf: a.opts.reorderMin, maxBuf: a.opts.reorderMax, policy: a.opts.policy}
 }
 
 // Accept 接收一条对端发起的聚合流，完成握手应答后返回。

@@ -66,6 +66,10 @@ type path struct {
 	rxRate  float64   // 平滑后的到达速率估计（字节/秒）
 
 	lastPingAt time.Time // 上次主动 PING 时刻（节流）
+
+	// ---- 路径策略层记账（#24，同由所属 Stream.mu 保护）----
+	auto     bool      // 是否由自动策略补挂（保守摘除只动这类路径）
+	lowSince time.Time // 速率份额持续垫底起始时刻（policySnapshot 维护）
 }
 
 // localAddr 返回本端地址（尽力而为：优先底层连接 multiaddr，退化 net.Addr）。
@@ -139,6 +143,11 @@ type PathInfo struct {
 	Transport PathTransport // 底层传输类型（规格书 §3.3，供 #20/#24 消费）
 	Local     net.Addr      // 本端地址（multiaddr 包装，取不到为 nil）
 	Remote    net.Addr      // 对端地址
+	// AttachedAt 是挂接时刻（策略层热身期/路径年龄判定用）。
+	AttachedAt time.Time
+	// AutoAdded 标记该路径由自动策略补挂（#24：默认策略的保守
+	// 摘除只动这类路径，手动加的一律不碰）。
+	AutoAdded bool
 
 	// ---- 调度指标快照（无样本时为零值）----
 	SRTT     time.Duration // 平滑 RTT（含底层排队延迟）
@@ -310,6 +319,25 @@ func (s *Stream) RemovePath(pathID uint64) error {
 	return nil
 }
 
+// pathInfoLocked 取一条路径的观测快照（供 Paths 与策略层
+// policySnapshot 共用）。调用方须持有 mu。
+func (s *Stream) pathInfoLocked(p *path, now time.Time) PathInfo {
+	return PathInfo{
+		ID:         p.id,
+		Dialed:     p.dialed,
+		ConnID:     p.connID(),
+		Transport:  p.transport(),
+		Local:      p.localAddr(),
+		Remote:     p.remoteAddr(),
+		AttachedAt: p.attachedAt,
+		AutoAdded:  p.auto,
+		SRTT:       p.srtt,
+		MinRTT:     p.minRTT,
+		EstRate:    p.effRate(now),
+		Inflight:   p.inflight,
+	}
+}
+
 // Paths 返回当前存活数据路径的观测快照（规格书 §8）。
 func (s *Stream) Paths() []PathInfo {
 	s.mu.Lock()
@@ -317,18 +345,7 @@ func (s *Stream) Paths() []PathInfo {
 	now := time.Now()
 	out := make([]PathInfo, 0, len(s.paths))
 	for _, p := range s.paths {
-		out = append(out, PathInfo{
-			ID:        p.id,
-			Dialed:    p.dialed,
-			ConnID:    p.connID(),
-			Transport: p.transport(),
-			Local:     p.localAddr(),
-			Remote:    p.remoteAddr(),
-			SRTT:      p.srtt,
-			MinRTT:    p.minRTT,
-			EstRate:   p.effRate(now),
-			Inflight:  p.inflight,
-		})
+		out = append(out, s.pathInfoLocked(p, now))
 	}
 	return out
 }
