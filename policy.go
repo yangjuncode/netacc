@@ -197,13 +197,13 @@ func (defaultPolicy) Decide(snap PolicySnapshot) PolicyDecision {
 // 影响。缺省为 DefaultPolicy()：决策票 #12 resolution 把自动策略
 // 列为内建能力但未定默认开关，本库取「默认开但可关」。
 func WithPolicy(p Policy) Option {
-	return func(o *options) { o.policy = p }
+	return aggOption(func(o *options) { o.policy = p })
 }
 
 // WithStreamPolicy 是 OpenStream 的逐调用策略覆盖（规格书 §8「opts
 // 可逐调用覆盖构造默认」）：传 nil 对该条流关闭自动化。
 func WithStreamPolicy(p Policy) OpenOption {
-	return func(o *openOptions) { o.policy = p }
+	return openOption(func(o *openOptions) { o.policy = p })
 }
 
 // ---------- Stream 侧执行层 ----------
@@ -273,7 +273,7 @@ func (s *Stream) policySnapshot(now time.Time) (PolicySnapshot, bool) {
 			p.lowSince = time.Time{}
 		}
 		paths = append(paths, PolicyPath{
-			PathInfo:    s.pathInfoLocked(p, now),
+			PathInfo:    p.info(now),
 			LowShareFor: sinceOrZero(p.lowSince, now),
 		})
 	}

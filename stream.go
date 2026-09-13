@@ -25,12 +25,15 @@ const (
 	defaultMaxReorderBuf = 32 << 20 // 32MiB
 )
 
-// errReset 是对端发来 RST 帧（或等价硬重置）时读/写侧返回的错误。
-var errReset = errors.New("netacc: 聚合流被对端重置")
+// ErrReset 是对端发来 RST 帧（或等价硬重置）时读/写侧返回的终态
+// 错误（#25 公开化：应用可用 errors.Is 区分「对端主动重置」与
+// ErrNoPaths 的「路径全部失活」）。
+var ErrReset = errors.New("netacc: 聚合流被对端重置")
 
-// errNoPaths 是最后一条数据路径也消失、且对端未曾正常关闭时
-// 聚合流的兜底终态错误。
-var errNoPaths = errors.New("netacc: 聚合流已无可用数据路径")
+// ErrNoPaths 是聚合流无任何可用数据路径时的错误（规格书 §8
+// 错误语义）：运行期最后一条路径失活后的流终态，以及存活路径
+// 集合为空时控制帧无从发出的兜底（errors.Is 可判定）。
+var ErrNoPaths = errors.New("netacc: 聚合流已无可用数据路径")
 
 // timeoutError 实现 net.Error，SetReadDeadline/SetWriteDeadline 到期返回。
 type timeoutError struct{}
@@ -75,6 +78,10 @@ type streamConfig struct {
 	// telemetryInterval 是收端 TELEMETRY 回报与窗口容量重算周期
 	// （规格 §5.2/§6），默认 defaultTelemetryInterval。
 	telemetryInterval time.Duration
+	// handshakeTimeout 是本流握手阶段（含 PATH_ATTACH 补挂）超时
+	// （#25 逐调用 WithHandshakeTimeout 的载体；≤0 = 不加额外超时，
+	// 语义由 handshakeCtxWith 处理，此处不做零值收敛）。
+	handshakeTimeout time.Duration
 	// policy 是流级路径策略钩子（#24，规格 §8）：nil 关闭自动化，
 	// 手动 AddPath/RemovePath 不受影响。取值由 Aggregator 选项
 	// （WithPolicy）与 OpenStream 逐调用选项（WithStreamPolicy）落到。
@@ -169,6 +176,19 @@ type Stream struct {
 	rerr          error  // 读侧终态：io.EOF=对端正常关闭；其它=传输错误
 	werr          error  // 写侧终态
 	closed        bool   // 本地 Close 或 teardown
+
+	// 重传统计（mu 保护，#25 Stats() 数据源）：lostSegs 记因路径
+	// 死亡被改判「待换路重发」的段数；resentSegs/resentBytes 记
+	// 实际重发出的段数与字节数（全流口径，含已死路径承担的）。
+	lostSegs    uint64
+	resentSegs  uint64
+	resentBytes uint64
+
+	// 事件订阅（#25，subMu 独立锁，与 mu 无锁序纠缠）：
+	// subs 为活跃订阅集；派发走非阻塞 send + dropped 计数，
+	// 慢订阅者不阻塞数据面（规格 §8 订阅只作通知用途）。
+	subMu sync.Mutex
+	subs  map[*subscription]struct{}
 
 	rChange chan struct{} // 读侧状态变化广播（chan 替换式）
 	wChange chan struct{} // 写侧状态变化广播
@@ -366,6 +386,7 @@ func (s *Stream) onTick() {
 	now := time.Now()
 	var rates []*pb.PathRate
 	var toPing []*path
+	var degraded []PathInfo // 本拍新判「疑似降级」的路径（mu 外发事件）
 	needSend := s.pendingBytes > 0 || len(s.unackedSegs) > 0
 	for _, p := range s.paths {
 		if p.rxMarkT.IsZero() {
@@ -389,21 +410,36 @@ func (s *Stream) onTick() {
 			p.rxMark, p.rxMarkT = p.rxBytes, now
 		}
 		// 两种探测触发（规格 §5.2：仅冷启动/过期/疑似降级）：
-		//  a) 正在收数据却无 RTT 样本——收端窗口容量联动需要
-		//     srtt（Σrate·max_srtt），纯收端没有 ACK 回显可采，
+		//  a) probeCold：正在收数据却无 RTT 样本——收端窗口容量联动
+		//     需要 srtt（Σrate·max_srtt），纯收端没有 ACK 回显可采，
 		//     用 PING 补齐。首条握手路径也靠它，不必建流即探；
-		//  b) 指标曾经有效但失联（est_rate 过期或 RTT 样本陈旧）
-		//     且有数据待发/在途——无需求时探测只会偷带宽。
-		probe := (p.rxBytes > 0 && !p.hasRTT) ||
-			(needSend && ((p.hasRate && now.Sub(p.lastRateAt) > p.staleAfter()) ||
-				(p.hasRTT && now.Sub(p.lastRTTAt) > rttStaleAfter)))
-		if probe && now.Sub(p.lastPingAt) > pingMinInterval {
+		//  b) probeStale：指标曾经有效但失联（est_rate 过期或 RTT
+		//     样本陈旧）且有数据待发/在途——无需求时探测只会偷带宽。
+		probeCold := p.rxBytes > 0 && !p.hasRTT
+		probeStale := needSend &&
+			((p.hasRate && now.Sub(p.lastRateAt) > p.staleAfter()) ||
+				(p.hasRTT && now.Sub(p.lastRTTAt) > rttStaleAfter))
+		// 疑似降级事件（#25）：probeStale 正是规格 §5.2「疑似降级」
+		// 的现成判据。沿触发——p.degraded 置位期间不重复发；判据
+		// 不再成立（新样本刷新/发送需求消失）即复位，恢复后再失联
+		// 可再次上报。
+		if probeStale && !p.degraded {
+			p.degraded = true
+			degraded = append(degraded, p.info(now))
+		} else if !probeStale && p.degraded {
+			p.degraded = false
+		}
+		if (probeCold || probeStale) && now.Sub(p.lastPingAt) > pingMinInterval {
 			p.lastPingAt = now
 			toPing = append(toPing, p)
 		}
 	}
 	s.updateWindowCapLocked()
 	s.mu.Unlock()
+
+	for _, info := range degraded {
+		s.emitEvent(EventPathDegraded, info, nil)
+	}
 
 	// 控制帧写出全部异步化：sendLoop 是 DATA/ACK 的唯一写者，
 	// 任何一条路径上的阻塞写（回压/底层滞留）都不许拖住泵——
@@ -542,6 +578,12 @@ func (s *Stream) trySend() bool {
 			rem.data = rem.data[len(payload):]
 		}
 		p.inflight += len(payload)
+		// 重传记账（#25）：段（帧）数与字节数同时累加到承担
+		// 重发的路径与全流口径（死路径承担过的部分也计入后者）
+		p.resentSegs++
+		p.resentBytes += uint64(len(payload))
+		s.resentSegs++
+		s.resentBytes += uint64(len(payload))
 	} else {
 		n := len(payload)
 		s.qHead += n
@@ -707,6 +749,7 @@ func (s *Stream) dropPath(p *path, cause error, notify bool) {
 		if s.unackedSegs[i].path == p {
 			p.inflight -= len(s.unackedSegs[i].data) // 在途账本同步核销
 			s.unackedSegs[i].path = nil
+			s.lostSegs++ // 该段改判「待换路重发」（#25 重传诱因统计）
 		}
 	}
 	empty := len(s.paths) == 0
@@ -717,12 +760,16 @@ func (s *Stream) dropPath(p *path, cause error, notify bool) {
 	if p.own != nil {
 		_ = p.own.Close()
 	}
+	// 事件订阅（#25）：摘除完成、在途段已改判重发后发
+	// PathRemoved——Info 是摘除前最后一眼，Cause 为摘除原因
+	// （主动 RemovePath/对端 PATH_DROP 时为 nil）。
+	s.emitEvent(EventPathRemoved, s.pathInfoOf(p), cause)
 	if notify {
 		s.sendPathDrop(p.id)
 	}
 	if empty {
 		if cause == nil {
-			cause = errNoPaths
+			cause = ErrNoPaths
 		}
 		if fin {
 			// 对端发过 FIN：读侧保持干净 EOF 语义
@@ -909,7 +956,7 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 			s.dropPath(p, io.EOF, false)
 			return
 		case frameRst:
-			s.shutdown(errReset)
+			s.shutdown(ErrReset)
 			return
 		default:
 			// PATH_ATTACH 只应出现在路径绑定子流首帧（聚合流上
@@ -1025,6 +1072,7 @@ func (s *Stream) Close() error {
 		s.broadcastLocked(&s.wChange)
 		s.mu.Unlock()
 		s.deregister()
+		s.closeSubs() // 关闭订阅通道，让订阅者 range 收尾（#25）
 	})
 	return nil
 }
@@ -1058,6 +1106,7 @@ func (s *Stream) shutdown(err error) {
 		s.broadcastLocked(&s.wChange)
 		s.mu.Unlock()
 		s.deregister()
+		s.closeSubs()
 	})
 }
 

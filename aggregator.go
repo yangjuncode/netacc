@@ -6,8 +6,9 @@
 // 见 stream.go / frame.go / reorder.go；多路径接入（PATH_ATTACH +
 // 对称加路径 + 轮询条带）由 #19 落地，见 path.go；中继路径按需协调
 // （PATH_REQUEST → reservation → PATH_READY → CONNECT）由 #21 落地，
-// 见 relaypath.go；调度器在 #20（scheduler.go）；路径策略层（内建
-// 自动策略 + 可插拔钩子）在 #24，见 policy.go。
+// 见 relaypath.go；调度器在 #20（scheduler.go）；观测面（Stats 快照 +
+// 事件订阅 + 选项/错误语义收尾）由 #25 落地，见 stats.go；路径策略层
+// （内建自动策略 + 可插拔钩子）在 #24，见 policy.go。
 package netacc
 
 import (
@@ -25,6 +26,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/transport"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	ma "github.com/multiformats/go-multiaddr"
+	msmux "github.com/multiformats/go-multistream"
 )
 
 // ProtocolID 是聚合流握手协议（兼首条数据路径）的 multistream 协议号。
@@ -41,12 +43,87 @@ const connmgrTag = "netacc"
 // defaultHandshakeTimeout 是握手阶段的默认超时（调用方 ctx 自带 deadline 时不生效）。
 const defaultHandshakeTimeout = time.Minute
 
-// ErrClosed 表示 Aggregator 已关闭。
-var ErrClosed = errors.New("netacc: aggregator 已关闭")
+// ---------- 公开错误（规格书 §8 错误语义，均可用 errors.Is 判定）----------
 
-// Option 是 New 的可选参数（规格书 §8 预留的扩展点）。
-type Option func(*options)
+var (
+	// ErrClosed 表示 Aggregator 已关闭（OpenStream/Accept 在
+	// Close 后返回；聚合流自身的关闭用标准库 net.ErrClosed）。
+	ErrClosed = errors.New("netacc: aggregator 已关闭")
 
+	// ErrHandshake 表示聚合流握手失败：对端未跑本协议、拒绝协商
+	// 或回显不符。包装底层 I/O 错误，errors.Is(err, ErrHandshake)
+	// 可判定「对端拒绝/不会本协议」这一类建流失败。
+	ErrHandshake = errors.New("netacc: 聚合流握手失败")
+
+	// ErrMinPaths 表示无法满足 WithMinPaths(n) 的路径数门槛：
+	// peerstore 无对端地址可补挂，或补挂后存活路径数仍不足。
+	// OpenStream 返回前已关闭建了一半的聚合流。
+	ErrMinPaths = errors.New("netacc: 无法满足 WithMinPaths 路径数门槛")
+
+	// ErrLastPath 表示 RemovePath 试图摘除最后一条存活数据路径
+	// （聚合流存活性要求 ≥1 条路径，规格书 §4.1）。
+	ErrLastPath = errors.New("netacc: 不能摘除最后一条数据路径")
+
+	// ErrUnknownPath 表示 RemovePath 给的 path_id 不在存活路径集中。
+	ErrUnknownPath = errors.New("netacc: 未知 path_id")
+
+	// ErrNoAggregator 表示该聚合流不挂在 Aggregator 上（测试构造的
+	// 管道流等），无 host 可拨号，AddPath/AddRelayPath 不可用。
+	ErrNoAggregator = errors.New("netacc: 该聚合流不经 Aggregator 创建，无法拨号加路径")
+)
+
+// ---------- 选项：构造默认 + 逐调用覆盖（规格书 §8、决策票 #12）----------
+
+// Option 是 New 的构造默认选项。逐流可配的选项（WithMinPaths、
+// WithHandshakeTimeout、WithReorderBuffer）返回的是 SharedOption——
+// 同一个 WithXxx 既能喂 New 作默认，也能喂 OpenStream 逐调用覆盖；
+// WithAcceptBacklog 只对 Accept 排队有意义，是纯 Option。
+type Option interface{ applyOption(*options) }
+
+// OpenOption 是 OpenStream 的逐调用选项（规格书 §8 的 opts...）：
+// 逐调用值只影响本次建流，不回写 Aggregator 默认。
+type OpenOption interface{ applyOpenOption(*openOptions) }
+
+// SharedOption 是构造默认与逐调用覆盖两用的选项（规格书 §8
+// 「opts... 逐调用覆盖构造默认」）：方法集同时覆盖 Option 与
+// OpenOption，实参位置传哪边都编译通过。
+type SharedOption interface {
+	Option
+	OpenOption
+}
+
+// optionSet 承载一个选项对两侧的作用；opt/open 任一为 nil 表示
+// 该侧不适用。它实现 SharedOption——两用选项（WithMinPaths 等）
+// 直接返回它。
+type optionSet struct {
+	opt  func(*options)
+	open func(*openOptions)
+}
+
+func (o optionSet) applyOption(c *options) {
+	if o.opt != nil {
+		o.opt(c)
+	}
+}
+func (o optionSet) applyOpenOption(c *openOptions) {
+	if o.open != nil {
+		o.open(c)
+	}
+}
+
+// aggOption 是仅构造侧生效的选项实现（不满足 OpenOption，
+// 误传给 OpenStream 会在编译期被拦下）。
+type aggOption func(*options)
+
+func (f aggOption) applyOption(o *options) { f(o) }
+
+// openOption 是仅逐调用侧生效的选项实现（不满足 Option，
+// 误传给 New 会在编译期被拦下）。
+type openOption func(*openOptions)
+
+func (f openOption) applyOpenOption(o *openOptions) { f(o) }
+
+// options 是 Aggregator 级配置（New 的默认值集合）。
 type options struct {
 	// acceptBacklog：已完成底层建流、等待 Accept 消费的最大排队数。
 	acceptBacklog int
@@ -55,51 +132,74 @@ type options struct {
 	// reorderMin / reorderMax：收端重排缓冲（连接级接收窗口）下界与硬顶，
 	// 容量 = clamp(Σest_rate·maxRTT, min, max)（规格书 §6）。
 	reorderMin, reorderMax int
+	// minPaths：OpenStream 的默认成功门槛——至少 n 条数据路径
+	// attached（规格书 §8；OpenStream 可逐调用覆盖）。
+	minPaths int
 	// policy：聚合流默认路径策略（#24，规格书 §8 可插拔钩子）。
 	// nil = 关闭自动化；默认见 New（DefaultPolicy()）。
 	policy Policy
 }
 
+// openOptions 是单次 OpenStream 的生效配置：先从 Aggregator 默认
+// 拷贝（defaultOpenOptions），再应用逐调用 OpenOption 覆盖。
+type openOptions struct {
+	minPaths         int
+	handshakeTimeout time.Duration
+	reorderMin       int
+	reorderMax       int
+	// policy：该条流的策略覆盖（WithStreamPolicy）；未给时沿用
+	// Aggregator 默认（defaultOpenOptions 先填 a.opts.policy）。
+	policy Policy
+}
+
 // WithAcceptBacklog 设置等待 Accept 的入向握手流排队长度（默认 16）。
+// 仅构造默认（逐流无对应语义，编译期不可传给 OpenStream）。
 func WithAcceptBacklog(n int) Option {
-	return func(o *options) { o.acceptBacklog = n }
+	return aggOption(func(o *options) { o.acceptBacklog = n })
 }
 
 // WithHandshakeTimeout 设置握手阶段超时（默认 1 分钟）。
 // 仅在调用方传入的 ctx 没有 deadline 时生效；设为 0 表示不加额外超时。
-func WithHandshakeTimeout(d time.Duration) Option {
-	return func(o *options) { o.handshakeTimeout = d }
+// 构造默认与 OpenStream 逐调用覆盖两用：逐调用值覆盖本次建流的
+// 握手与补挂（PATH_ATTACH）全程。
+func WithHandshakeTimeout(d time.Duration) SharedOption {
+	return optionSet{
+		opt:  func(o *options) { o.handshakeTimeout = d },
+		open: func(o *openOptions) { o.handshakeTimeout = d },
+	}
 }
 
 // WithReorderBuffer 设置收端重排缓冲（连接级接收窗口）的上下界，
 // 默认 1MiB / 32MiB（规格书 §6）。容量取
 // clamp(Σest_rate·maxRTT, min, max)；min 建议不小于最大单路径 BDP，
 // max 是内存保护硬顶。min/max 非法（≤0 或 min>max）时收敛到默认。
-func WithReorderBuffer(min, max int) Option {
-	return func(o *options) {
-		if min <= 0 || max <= 0 || min > max {
-			return
-		}
-		o.reorderMin, o.reorderMax = min, max
+// 构造默认与 OpenStream 逐调用覆盖两用（逐调用值只作用于本条流）。
+func WithReorderBuffer(min, max int) SharedOption {
+	return optionSet{
+		opt: func(o *options) {
+			if min <= 0 || max <= 0 || min > max {
+				return
+			}
+			o.reorderMin, o.reorderMax = min, max
+		},
+		open: func(o *openOptions) {
+			if min <= 0 || max <= 0 || min > max {
+				return
+			}
+			o.reorderMin, o.reorderMax = min, max
+		},
 	}
 }
 
-// OpenOption 是 OpenStream 的逐调用选项（规格书 §8 的 opts...，逐调用覆盖构造默认）。
-type OpenOption func(*openOptions)
-
-type openOptions struct {
-	// minPaths：OpenStream 的成功门槛——至少 n 条数据路径 attached（规格书 §8）。
-	minPaths int
-	// policy：该条流的策略覆盖（WithStreamPolicy）；未给时沿用
-	// Aggregator 默认（OpenStream 里先填 a.opts.policy 再套选项）。
-	policy Policy
-}
-
-// WithMinPaths 要求聚合流至少挂接 n 条数据路径才算建立成功（规格书 §8）。
-// n > 1 时 OpenStream 在握手后用 peerstore 中的对端地址逐条直拨补挂，
-// 补不齐则关闭聚合流并返回错误。
-func WithMinPaths(n int) OpenOption {
-	return func(o *openOptions) { o.minPaths = n }
+// WithMinPaths 要求聚合流至少挂接 n 条数据路径才算建立成功
+// （规格书 §8，n<1 按 1 处理）。n > 1 时 OpenStream 在握手后用
+// peerstore 中的对端地址逐条直拨补挂，补不齐则关闭聚合流并返回
+// ErrMinPaths 包装的错误。构造默认与 OpenStream 逐调用覆盖两用。
+func WithMinPaths(n int) SharedOption {
+	return optionSet{
+		opt:  func(o *options) { o.minPaths = n },
+		open: func(o *openOptions) { o.minPaths = n },
+	}
 }
 
 // Aggregator 是聚合库的公开入口：OpenStream 主动发起聚合流，
@@ -142,6 +242,7 @@ func New(h host.Host, opts ...Option) *Aggregator {
 			handshakeTimeout: defaultHandshakeTimeout,
 			reorderMin:       defaultMinReorderBuf,
 			reorderMax:       defaultMaxReorderBuf,
+			minPaths:         1, // 规格书 §8 默认：≥1 条数据路径 attached 即成功
 			// 默认开启内建自动策略（决策票 #12 未定默认开关——取
 			// 「默认开但可关」：规格 §8 将其列为内建能力，关闭须
 			// 显式 WithPolicy(nil)）。
@@ -150,7 +251,7 @@ func New(h host.Host, opts ...Option) *Aggregator {
 		streams: make(map[[16]byte]*Stream),
 	}
 	for _, o := range opts {
-		o(&a.opts)
+		o.applyOption(&a.opts)
 	}
 	a.acceptCh = make(chan network.Stream, a.opts.acceptBacklog)
 	h.SetStreamHandler(ProtocolID, a.handleStream)
@@ -289,28 +390,53 @@ func (a *Aggregator) transportForDialing(addr ma.Multiaddr) transport.Transport 
 	return sw.TransportForDialing(addr)
 }
 
+// defaultOpenOptions 把 Aggregator 构造默认拷贝成一份 openOptions，
+// OpenStream 在此基础上应用逐调用 OpenOption 覆盖（规格书 §8：
+// 构造时配默认值，opts... 逐调用覆盖）。
+func (a *Aggregator) defaultOpenOptions() openOptions {
+	return openOptions{
+		minPaths:         a.opts.minPaths,
+		handshakeTimeout: a.opts.handshakeTimeout,
+		reorderMin:       a.opts.reorderMin,
+		reorderMax:       a.opts.reorderMax,
+		policy:           a.opts.policy,
+	}
+}
+
 // OpenStream 向 peer 发起一条聚合流：在已有连接上开 /netacc/agg/1.0.0
 // 握手流，协商出 128bit agg_stream_id；握手流同时升格为第一条数据路径。
 //
 // 握手流目前经 host.NewStream 由 swarm 自选连接（规格书「任意已有连接」）。
 // 成功即表示至少一条数据路径 attached；WithMinPaths(n) 时继续在
 // peerstore 地址上直拨补挂，补不齐返回 error（规格书 §8）。
+//
+// 错误语义（errors.Is 可判定）：Aggregator 已关 → ErrClosed；
+// 握手协议失败（对端未跑本协议/拒绝/回显不符）→ ErrHandshake；
+// minPaths 门槛补挂不足 → ErrMinPaths；开握手流的传输层失败
+// 保留 swarm 原始错误（如 network.ErrNoConn）。
 func (a *Aggregator) OpenStream(ctx context.Context, p peer.ID, opts ...OpenOption) (*Stream, error) {
 	if a.closed.Load() {
 		return nil, ErrClosed
 	}
-	oo := openOptions{minPaths: 1, policy: a.opts.policy}
+	oo := a.defaultOpenOptions()
 	for _, opt := range opts {
-		opt(&oo)
+		opt.applyOpenOption(&oo)
 	}
 	// 防止 connmgr 修剪聚合对端的连接
 	a.host.ConnManager().Protect(p, connmgrTag)
 
 	s, err := a.host.NewStream(ctx, p, ProtocolID)
 	if err != nil {
+		// 对端未跑本协议：multistream 协商在 NewStream 内完成，
+		// 失败值可判定（ErrNotSupported）——语义化为 ErrHandshake。
+		// 其余失败是传输层问题（无连接/无地址/超时），保留原始错误。
+		var notSupp msmux.ErrNotSupported[protocol.ID]
+		if errors.As(err, &notSupp) {
+			return nil, fmt.Errorf("netacc: %w: 对端不支持 %s: %w", ErrHandshake, ProtocolID, err)
+		}
 		return nil, fmt.Errorf("netacc: 开握手流失败: %w", err)
 	}
-	hsCtx, cancel := a.handshakeCtx(ctx)
+	hsCtx, cancel := a.handshakeCtxWith(ctx, oo.handshakeTimeout)
 	defer cancel()
 	stop := watchStreamCtx(s, hsCtx)
 	defer stop()
@@ -318,7 +444,7 @@ func (a *Aggregator) OpenStream(ctx context.Context, p peer.ID, opts ...OpenOpti
 	id, err := handshakeInitiator(s)
 	if err != nil {
 		_ = s.Reset()
-		return nil, fmt.Errorf("netacc: 握手失败: %w", err)
+		return nil, fmt.Errorf("netacc: %w: %w", ErrHandshake, err)
 	}
 	if err := ctx.Err(); err != nil {
 		// 握手完成与 ctx 取消竞态：看守 goroutine 可能已 Reset 掉流，
@@ -326,9 +452,7 @@ func (a *Aggregator) OpenStream(ctx context.Context, p peer.ID, opts ...OpenOpti
 		_ = s.Reset()
 		return nil, err
 	}
-	cfg := a.streamCfg()
-	cfg.policy = oo.policy
-	st := newStreamFull(id, s, cfg, a, p, true)
+	st := newStreamFull(id, s, a.streamCfg(oo), a, p, true)
 	// 先注册再 start：对端收到 HelloAck 后即可反向 PATH_ATTACH 过来，
 	// 注册须先于「对端能感知本流存在」的任何信号。
 	a.register(st)
@@ -345,11 +469,12 @@ func (a *Aggregator) OpenStream(ctx context.Context, p peer.ID, opts ...OpenOpti
 // attachMinPaths 兑现 WithMinPaths(n)：用 peerstore 中的对端地址
 // 逐条直拨补挂路径，直到存活路径数 ≥ n。一轮全地址零进展即放弃。
 // 同一地址重复直拨会建多条物理连接——规格书 §1：同一传输开多条
-// 连接也算多条路径。
+// 连接也算多条路径。一切失败（含「无地址可补」）都包装 ErrMinPaths，
+// 调用方 errors.Is(err, ErrMinPaths) 即可判定门槛未满足。
 func (s *Stream) attachMinPaths(ctx context.Context, n int) error {
 	addrs := s.agg.host.Peerstore().Addrs(s.peer)
 	if len(addrs) == 0 {
-		return fmt.Errorf("netacc: peerstore 无对端地址，WithMinPaths(%d) 无法补挂路径", n)
+		return fmt.Errorf("netacc: %w: peerstore 无对端地址，WithMinPaths(%d) 无法补挂路径", ErrMinPaths, n)
 	}
 	// 按 §3.3 传输偏好先排序：TCP/WS 优先于 UDP 系（QUIC/WT/WebRTC
 	// 同生共死，未实测带宽前不应抢占补挂名额）。这只是先验排序，
@@ -366,16 +491,22 @@ func (s *Stream) attachMinPaths(ctx context.Context, n int) error {
 			}
 		}
 		if !progress {
-			return fmt.Errorf("netacc: 补挂路径后仍只有 %d 条，不满足 WithMinPaths(%d)",
-				len(s.Paths()), n)
+			return fmt.Errorf("netacc: %w: 补挂路径后仍只有 %d 条，不满足 WithMinPaths(%d)",
+				ErrMinPaths, len(s.Paths()), n)
 		}
 	}
 	return nil
 }
 
-// streamCfg 把 Aggregator 选项落到聚合流参数。
-func (a *Aggregator) streamCfg() streamConfig {
-	return streamConfig{minBuf: a.opts.reorderMin, maxBuf: a.opts.reorderMax, policy: a.opts.policy}
+// streamCfg 把本次建流的生效选项（构造默认 + 逐调用覆盖的合成结果）
+// 落到聚合流数据面参数。Accept 侧无 OpenOption，直接用构造默认。
+func (a *Aggregator) streamCfg(oo openOptions) streamConfig {
+	return streamConfig{
+		minBuf:           oo.reorderMin,
+		maxBuf:           oo.reorderMax,
+		handshakeTimeout: oo.handshakeTimeout,
+		policy:           oo.policy,
+	}
 }
 
 // Accept 接收一条对端发起的聚合流，完成握手应答后返回。
@@ -395,7 +526,7 @@ func (a *Aggregator) Accept(ctx context.Context) (*Stream, error) {
 				_ = s.Reset()
 				continue // 坏握手不影响后续入流
 			}
-			st := newStreamFull(id, s, a.streamCfg(), a, s.Conn().RemotePeer(), false)
+			st := newStreamFull(id, s, a.streamCfg(a.defaultOpenOptions()), a, s.Conn().RemotePeer(), false)
 			// 注册先于回执：HelloAck 到达对端后，对端的 PATH_ATTACH
 			// 随时可能到——路由表必须先就位，否则合法的首挂路径被 reset。
 			a.register(st)
@@ -420,12 +551,21 @@ func (a *Aggregator) Accept(ctx context.Context) (*Stream, error) {
 }
 
 // handshakeCtx 为握手阶段派生 ctx：调用方已带 deadline 时原样返回，
-// 否则套 Aggregator 的握手超时（防对端建流后挂死不回包）。
+// 否则套 Aggregator 构造默认的握手超时（防对端建流后挂死不回包）。
+// OpenStream 路径请用 handshakeCtxWith 传入逐调用覆盖后的超时。
 func (a *Aggregator) handshakeCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	if _, ok := ctx.Deadline(); ok || a.opts.handshakeTimeout <= 0 {
+	return a.handshakeCtxWith(ctx, a.opts.handshakeTimeout)
+}
+
+// handshakeCtxWith 同 handshakeCtx，但超时时长由调用方给定——
+// OpenStream 的逐调用 WithHandshakeTimeout 经此覆盖构造默认；
+// 聚合流存进 streamConfig.handshakeTimeout 后，补挂握手
+// （attachDialedConn）也沿用同一份逐调用值。
+func (a *Aggregator) handshakeCtxWith(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok || d <= 0 {
 		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, a.opts.handshakeTimeout)
+	return context.WithTimeout(ctx, d)
 }
 
 // Close 注销流处理器并标记关闭；已建立的聚合流不受影响
