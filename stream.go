@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,11 @@ var ErrReset = errors.New("netacc: 聚合流被对端重置")
 // 集合为空时控制帧无从发出的兜底（errors.Is 可判定）。
 var ErrNoPaths = errors.New("netacc: 聚合流已无可用数据路径")
 
+// errPathRTO 是路径级软失效超时：可疑态持续超过路径 RTO
+// （srtt+4·rttvar，下界 pathRTOFloor）仍无活性证据时按硬失效
+// 摘除（规格 §5.3「路径 RTO 到期才摘除」，#23）。
+var errPathRTO = errors.New("netacc: 路径 RTO 到期无 ACK 进展")
+
 // timeoutError 实现 net.Error，SetReadDeadline/SetWriteDeadline 到期返回。
 type timeoutError struct{}
 
@@ -57,12 +63,20 @@ type pathConn interface {
 }
 
 // sendSeg 是一段已发未确认数据：保留至连接级 ACK 释放。
-// path 记录它当前在哪条路径在途；路径死亡时改置 nil 表示
-// 「待换路重发」（保持原字节偏移，规格书 §5.3）。
+// path 记录它当前在哪条路径在途；路径死亡或被判软失效掉队时
+// 改置 nil 表示「待（换路）重发」（保持原字节偏移，规格书 §5.3）。
 type sendSeg struct {
 	off  uint64
 	data []byte
 	path *path // nil = 待重发
+	// sentAt 是当前这份拷贝的发出时刻（重发会刷新），软失效
+	// 判定据此算在途时长；path==nil 时不被消费。
+	sentAt time.Time
+	// sacked 表示本段区间已被对端 SACK ranges 覆盖（乱序暂存在
+	// 收端）：不再参与任何重发，原地等 cum 推进释放——规格 §5.3
+	// 「发送缓冲保留至连接级 ACK」对已被对端持有的字节同样保留
+	// 记账，只是永不重发。
+	sacked bool
 }
 
 // streamConfig 是聚合流数据面参数。
@@ -117,7 +131,11 @@ func (c streamConfig) windowCap() int {
 //     PING 仅用于新路径冷启动与指标过期探测（规格 §5.2）；
 //   - 路径集合：PATH_ATTACH 绑定新路径（path_id 分侧命名空间），
 //     路径死亡即摘除并把其在途未确认段重注入剩余路径（重排缓冲
-//     按偏移去重，重复字节安全）；PATH_DROP 带内告知对端。
+//     按偏移去重，重复字节安全）；PATH_DROP 带内告知对端；
+//   - 失效恢复（#23，规格 §5.3）：路径在途段 k·srtt 无 ACK/SACK
+//     覆盖 → 标可疑并搬回重发池做机会重发 + 调度降权；可疑态
+//     持续超过路径 RTO 仍无活性证据 → 按硬失效摘除；ACK 的
+//     SACK ranges 参与补洞决策，冗余发送仅限这种失效过渡期。
 //
 // 并发结构：一个 sendLoop goroutine 独占 DATA/ACK/PING/TELEMETRY
 // 帧写出（并承担周期 tick：TELEMETRY 回报、窗口容量重算、过期
@@ -168,6 +186,12 @@ type Stream struct {
 	ackSeq       uint64    // 本侧 ACK 序号（逐帧递增）
 	peerAckSeq   uint64    // 对端最新 ACK 序号（丢弃跨路径超车的旧 ACK）
 	gotPeerAck   bool      // 是否已收到对端首个 ACK
+	// peerRanges 是「最新一条已应用 ACK」携带的 SACK 乱序区间
+	//（已排序合并）。它回答「对端重排缓冲里实际持有哪些字节」——
+	// 机会重发只补未被覆盖的洞（已收区间不重发，规格 §5.3）；
+	// 因收端 cap 检查被丢的段永不出现于此，发送端据此识别
+	// 「这段对端其实没有」并靠软失效超时兜底补发（#19 遗留边角）。
+	peerRanges []byteRange
 
 	// 接收侧（mu 保护）
 	lastDataTs    uint64 // 最近收到的 DATA 帧发送时间戳（ACK 回显用）
@@ -376,7 +400,9 @@ func (s *Stream) sendLoop() {
 //     只报有新到达字节的路径，全静默则不占带宽）；
 //  2. 按 Σest_rate·max_srtt 重算收端窗口容量（规格 §6 窗口联动）；
 //  3. 对「指标失联且有发送需求」的路径发 PING 探测（规格 §5.2：
-//     主动探测仅限冷启动/过期/疑似降级，不常态化）。
+//     主动探测仅限冷启动/过期/疑似降级，不常态化）；
+//  4. 软失效扫描（#23，规格 §5.3）：逾期未覆盖段标可疑 + 搬回
+//     重发池换路重发，可疑超 RTO 的路径按硬失效摘除。
 func (s *Stream) onTick() {
 	s.mu.Lock()
 	if s.closed {
@@ -429,12 +455,17 @@ func (s *Stream) onTick() {
 		} else if !probeStale && p.degraded {
 			p.degraded = false
 		}
-		if (probeCold || probeStale) && now.Sub(p.lastPingAt) > pingMinInterval {
+		//  c) 可疑路径（#23）：被标 suspect 的路径需要一条 PING
+		//     应答来自证活性——应答即新 RTT 样本 → 清除可疑态，
+		//     应答永远不来 → RTO 到期摘除。真实活着但恰逢静默的
+		//     路径靠它免遭误摘。
+		if (probeCold || probeStale || p.suspect) && now.Sub(p.lastPingAt) > pingMinInterval {
 			p.lastPingAt = now
 			toPing = append(toPing, p)
 		}
 	}
 	s.updateWindowCapLocked()
+	drops, moved := s.checkSoftFailLocked(now)
 	s.mu.Unlock()
 
 	for _, info := range degraded {
@@ -449,6 +480,14 @@ func (s *Stream) onTick() {
 	}
 	for _, p := range toPing {
 		go s.sendPing(p, false, s.sendTs())
+	}
+	// 可疑路径持续无活性证据超 RTO → 硬失效摘除（其名下剩余
+	// 在途段由 dropPath 照常重注入存活路径，规格 §5.3）。
+	for _, p := range drops {
+		s.dropPath(p, errPathRTO, true)
+	}
+	if moved {
+		s.wakeSend() // 搬回重发池的段立刻经调度器换路重发
 	}
 	// 路径策略评估（#24）：Decide 是应用代码、决策执行含拨号 I/O，
 	// 一律异步出泵；runPolicy 内 policyEvalActive 去抖保证串行。
@@ -501,21 +540,184 @@ func (s *Stream) updateWindowCapLocked() {
 	}
 }
 
-// firstResendLocked 返回首个「路径已死、待换路重发」的 unacked 段
-// 下标，无则 -1。线性扫描：段数受窗口/帧长上界约束（数百量级），
-// 代价可忽略；精细化的重传调度（机会重发/软失效/RTO）属 #23。
-// 调用方须持有 mu。
-func (s *Stream) firstResendLocked() int {
-	for i := range s.unackedSegs {
-		if s.unackedSegs[i].path == nil {
-			return i
+// firstHole 返回 [off,end) 内第一个未被 ranges 覆盖的子区间
+// [a,b)；全覆盖时返回 a>=b 的空区间。ranges 须已排序合并
+// （见 normalizeRanges）。
+func firstHole(off, end uint64, rs []byteRange) (uint64, uint64) {
+	cur := off
+	for _, r := range rs {
+		if r.end <= cur {
+			continue
+		}
+		if r.start > cur {
+			return cur, min(r.start, end)
+		}
+		cur = r.end
+		if cur >= end {
+			return end, end
 		}
 	}
-	return -1
+	if cur < end {
+		return cur, end
+	}
+	return end, end
+}
+
+// coveredBy 报告 [off,end) 是否被某条已合并区间完整覆盖
+// （ranges 排序合并后，连续覆盖必然落在单条区间内）。
+func coveredBy(rs []byteRange, off, end uint64) bool {
+	for _, r := range rs {
+		if r.start <= off && r.end >= end {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeRanges 把对端发来的 SACK 区间排序合并为规范形式
+// （诚实对端发出的本就有序，此处防御乱序/重叠输入）。原地排序。
+func normalizeRanges(rs []byteRange) []byteRange {
+	if len(rs) < 2 {
+		return rs
+	}
+	sort.Slice(rs, func(i, j int) bool { return rs[i].start < rs[j].start })
+	out := rs[:0]
+	for _, r := range rs {
+		if len(out) > 0 && r.start <= out[len(out)-1].end {
+			if r.end > out[len(out)-1].end {
+				out[len(out)-1].end = r.end
+			}
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// nextResendLocked 在重发池（path==nil 的 unacked 段）里选出下一段
+// 真正缺失的区间：先按最新 SACK（peerRanges）挖掉对端已收部分——
+// 只补洞不重发已收字节（规格 §5.3「已收区间不重发」）。整段已被
+// 覆盖的段标记 sacked 后跳过（不再重发，等 cum 释放）。
+// 返回段下标与待重发区间 [hs,he)；无可发返回 -1。线性扫描：段数
+// 受窗口/帧长上界约束（数百量级），代价可忽略。
+// 调用方须持有 mu。
+func (s *Stream) nextResendLocked() (idx int, hs, he uint64) {
+	for i := range s.unackedSegs {
+		rs := &s.unackedSegs[i]
+		if rs.path != nil || rs.sacked {
+			continue
+		}
+		a, b := firstHole(rs.off, rs.off+uint64(len(rs.data)), s.peerRanges)
+		if a >= b {
+			rs.sacked = true // 整段已在收端：等 cum 释放即可
+			continue
+		}
+		return i, a, b
+	}
+	return -1, 0, 0
+}
+
+// splitResendLocked 把 unackedSegs[i] 中 [hs, hs+n) 切出记到
+// 路径 p 名下（path=p, sentAt=now）：前缀部分（若有）已被对端
+// SACK 覆盖——保留记账到 cum 释放、不再重发（sacked）；后缀
+// （若有）留在重发池（path=nil）等下一轮——其中可能仍含已覆盖
+// 的内部小洞，由下次 nextResendLocked 的挖洞再细分。
+// 拆分保持 unackedSegs 按 off 升序、互不重叠的平铺不变量。
+// 调用方须持有 mu。
+func (s *Stream) splitResendLocked(i int, hs uint64, n int, p *path, now time.Time) {
+	rs := s.unackedSegs[i]
+	d0 := int(hs - rs.off)
+	parts := make([]sendSeg, 0, 3)
+	if d0 > 0 {
+		// 前缀全被 SACK 覆盖：字节已在收端，记账等 cum 释放
+		parts = append(parts, sendSeg{off: rs.off, data: rs.data[:d0], sacked: true})
+	}
+	parts = append(parts, sendSeg{off: hs, data: rs.data[d0 : d0+n], path: p, sentAt: now})
+	if rem := d0 + n; rem < len(rs.data) {
+		parts = append(parts, sendSeg{off: hs + uint64(n), data: rs.data[rem:]})
+	}
+	// 用 parts 替换第 i 项：inner append 落到新数组（parts 容量
+	// 恰好 3），再拼回原切片，不会踩塌 unackedSegs 底层数组。
+	tail := append(parts, s.unackedSegs[i+1:]...)
+	s.unackedSegs = append(s.unackedSegs[:i], tail...)
+}
+
+// checkSoftFailLocked 是软失效判定与机会重发的入口（规格 §5.3，
+// #23），由发送泵周期 tick 驱动：检测延迟 ≤ telemetryInterval，
+// 数据流本身的 ACK 节奏隐含其中，不靠常态化探测（§5.2）。
+//
+// 判定：路径名下在途段超过 suspectAfter（k·srtt，下界
+// suspectFloor）仍未被 cum/SACK 覆盖 → 该路径标 suspect
+// （调度降权见 pickData/inflightCap 的 penalty 折算），并把段
+// 搬回重发池（path=nil，保持原字节偏移）——下一轮 trySend 经
+// 调度器换到当前最优路径重发；单路径时自然落回同路径超时重发
+// （draft-quic-multipath §5.6 的策略 a/b 同时落地）。
+//
+// SACK 的关键作用：被覆盖的段不算失联——字节已到对端只是堵在
+// 重排缓冲里，标 sacked 等 cum 释放，不再重发（防伪重传）；
+// 反过来，因收端缓冲 cap 检查被丢的段永不进 SACK——它持续
+// 「未覆盖」就会被搬回重发池补洞，这正是 #19 遗留边角（重发段
+// 乱序到达被 cap 丢弃后不再重发可致洞首停摆）的修复。
+//
+// 可疑态持续超过路径 RTO（rto()，RFC 6298 风格 srtt+4·rttvar
+// 下界 pathRTOFloor）仍无活性证据 → 返回待摘除路径列表，
+// 调用方须在 mu 外走 dropPath 硬失效流程（未确认段照常重注入）。
+// 活性证据必须「新鲜」——能界在标记之后：该路径发出的、晚于
+// suspectSinceTs 的帧所产生的回显（ACK ts_echo 或 PING 应答，
+// 见 noteRTT）；SACK 覆盖与 cum 推进都不算——前者可能是标记前
+// 发出的旧拷贝刚走到，后者只说明对端有这些字节（死路径的字节
+// 经他路重发照样推进 cum），都不含路径新鲜度。
+func (s *Stream) checkSoftFailLocked(now time.Time) (drops []*path, moved bool) {
+	for i := range s.unackedSegs {
+		seg := &s.unackedSegs[i]
+		if seg.sacked {
+			continue
+		}
+		end := seg.off + uint64(len(seg.data))
+		if coveredBy(s.peerRanges, seg.off, end) {
+			seg.sacked = true
+			if seg.path != nil {
+				// 字节已到对端：当场释放 inflight 账本——若等 cum
+				// 推进才释放，已送达字节会把路径在途量钉死在硬顶，
+				// 堵住真正待补的洞（环形死锁）。cum 释放时只补记
+				// 交付量（creditDelivered，见 freeAckedLocked）。
+				// 注意此处不清 suspect：SACK 覆盖可能来自标记前
+				// 就发出的旧拷贝，不含路径新鲜度——活性证据统一
+				// 走 noteRTT 的 echoTs>suspectSinceTs 判定。
+				seg.path.inflight -= len(seg.data)
+			}
+			continue
+		}
+		if seg.path == nil {
+			continue // 已在重发池等下一轮
+		}
+		if now.Sub(seg.sentAt) <= seg.path.suspectAfter() {
+			continue // 还在该路径正常往返预算内
+		}
+		// 逾期未覆盖 → 标可疑（suspectSince/suspectSinceTs 只在首次
+		// 置位时记录，此后须靠晚于它的活性证据复位，见 noteRTT）
+		// 并把段搬回重发池；inflight 账本同步释放，重发时记到新
+		// 路径名下。
+		p := seg.path
+		if !p.suspect {
+			p.suspect = true
+			p.suspectSince = now
+			p.suspectSinceTs = s.sendTs()
+		}
+		p.inflight -= len(seg.data)
+		seg.path = nil
+		moved = true
+	}
+	for _, p := range s.paths {
+		if p.suspect && now.Sub(p.suspectSince) > p.rto() {
+			drops = append(drops, p)
+		}
+	}
+	return drops, moved
 }
 
 // trySend 发一帧 DATA；返回 false 表示暂无可发。
-// 优先级：死路径遗留段重发 > 新数据。重发不受窗口余量约束
+// 优先级：重发池补洞 > 新数据。重发不受窗口余量约束
 // （理由见下）；新数据仍须 unacked < 对端通告窗口。
 // 选路交给调度器（规格 §5.1 最短排空时间优先 + inflight 硬顶）：
 // 先确定本帧载荷再选路，帧长是排空时间的输入。
@@ -525,20 +727,26 @@ func (s *Stream) trySend() bool {
 		s.mu.Unlock()
 		return false
 	}
+	now := time.Now()
 	var off uint64
 	var payload []byte
 	resendIdx := -1
-	if i := s.firstResendLocked(); i >= 0 {
-		// 死路径遗留段优先重发，且豁免窗口检查：这些字节区间本就
+	var resendEnd uint64
+	if i, hs, he := s.nextResendLocked(); i >= 0 {
+		// 重发池补洞优先，且豁免窗口检查：这些字节区间本就
 		// 计入 unacked（窗口账本之内），对端要么已收（重排缓冲按
 		// 偏移去重丢弃）、要么正是它等不到的那块。若按窗口卡死，
 		// 「数据已送达但 ACK 随死路径丢失」会让发送端视角的窗口
 		// 被僵尸在途量占满——不重发即死锁。
+		// 洞宽超单帧上限则按 maxFramePayload 重新切分（规格 §5.3
+		// 「帧允许按 offset+len 重新切分」；本实现的路径抽象为
+		// 保序字节流、不暴露逐路径 MTU/缓冲上限，重切分粒度只需
+		// 满足帧上限与洞边界）。
 		resendIdx = i
-		rs := &s.unackedSegs[i]
-		n := int(min(uint64(len(rs.data)), uint64(maxFramePayload)))
-		off = rs.off
-		payload = rs.data[:n]
+		resendEnd = min(he, hs+uint64(maxFramePayload))
+		off = hs
+		d0 := hs - s.unackedSegs[i].off
+		payload = s.unackedSegs[i].data[d0 : d0+(resendEnd-hs)]
 	} else {
 		// 新数据受窗口约束：unacked ≥ 对端通告窗口即停摆
 		// （uint64 计算防对端通告巨大值溢出）。
@@ -554,29 +762,16 @@ func (s *Stream) trySend() bool {
 	}
 	// 调度器分帧决策；返回 nil 表示全部路径在途顶满，本轮不发，
 	// 等 ACK 释放 inflight（或 TELEMETRY 校准）后 wakeSend 再试。
-	p := s.sched.pickData(s.paths, len(payload), time.Now())
+	p := s.sched.pickData(s.paths, len(payload), now)
 	if p == nil {
 		s.mu.Unlock()
 		return false
 	}
 	if resendIdx >= 0 {
-		rs := &s.unackedSegs[resendIdx]
-		if len(payload) == len(rs.data) {
-			rs.path = p // 整段挂到新在途路径
-		} else {
-			// 段超单帧上限：已发部分立独立条目记在 p 名下，余量
-			// 留在原位（path 仍 nil）等下一轮——否则 p 再死时已发
-			// 部分无人记账，字节区间会永久失联。
-			// 注意先插入后截断：append 可能整体搬移底层数组，
-			// 经 rs 直接改原段会写到旧数组上而丢失。
-			sent := sendSeg{off: rs.off, data: payload, path: p}
-			s.unackedSegs = append(s.unackedSegs, sendSeg{})
-			copy(s.unackedSegs[resendIdx+1:], s.unackedSegs[resendIdx:])
-			s.unackedSegs[resendIdx] = sent
-			rem := &s.unackedSegs[resendIdx+1]
-			rem.off += uint64(len(payload))
-			rem.data = rem.data[len(payload):]
-		}
+		// 把本帧覆盖的洞段切出记到新路径名下；SACK 已覆盖的前缀
+		// 标 sacked 保留记账，剩余后缀留在重发池等下一轮——否则
+		// p 再死时已发部分无人记账，字节区间会永久失联。
+		s.splitResendLocked(resendIdx, off, len(payload), p, now)
 		p.inflight += len(payload)
 		// 重传记账（#25）：段（帧）数与字节数同时累加到承担
 		// 重发的路径与全流口径（死路径承担过的部分也计入后者）
@@ -594,7 +789,7 @@ func (s *Stream) trySend() bool {
 		}
 		s.sentOff += uint64(n)
 		s.pendingBytes -= n
-		s.unackedSegs = append(s.unackedSegs, sendSeg{off: off, data: payload, path: p})
+		s.unackedSegs = append(s.unackedSegs, sendSeg{off: off, data: payload, path: p, sentAt: now})
 		p.inflight += n
 	}
 	ts := s.sendTs()
@@ -747,7 +942,11 @@ func (s *Stream) dropPath(p *path, cause error, notify bool) {
 	delete(s.pathsByID, p.id)
 	for i := range s.unackedSegs {
 		if s.unackedSegs[i].path == p {
-			p.inflight -= len(s.unackedSegs[i].data) // 在途账本同步核销
+			// sacked 段的 inflight 在被 SACK 覆盖时已释放，跳过防
+			// 二次核销；其余在途账本同步核销
+			if !s.unackedSegs[i].sacked {
+				p.inflight -= len(s.unackedSegs[i].data)
+			}
 			s.unackedSegs[i].path = nil
 			s.lostSegs++ // 该段改判「待换路重发」（#25 重传诱因统计）
 		}
@@ -885,7 +1084,7 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 			if f.tsPath != 0 && f.tsEcho != 0 {
 				if q := s.pathsByID[f.tsPath-1]; q != nil {
 					r := time.Duration(s.sendTs()-f.tsEcho) * time.Microsecond
-					q.noteRTT(r, now)
+					q.noteRTT(r, now, f.tsEcho)
 				}
 			}
 			// 防御：对端不应确认未发送的字节；谎报时收敛到已发边界，
@@ -899,7 +1098,11 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 			}
 			s.advWindow = f.window
 			s.gotWindow = true
-			// f.ranges（SACK 乱序区间）留给 #23 的重传/换路决策。
+			// 消费 SACK ranges（#23）：记录对端重排缓冲实际持有的
+			// 乱序区间——软失效扫描据此区分「在路上/被丢弃」与
+			// 「已到对端等 cum」，重发只补真正缺失的洞。过期 ACK 已在
+			// 上面被 seq 过滤，此处恒为最新快照。
+			s.peerRanges = normalizeRanges(f.ranges)
 			s.broadcastLocked(&s.wChange)
 			s.mu.Unlock()
 			s.wakeSend()
@@ -914,7 +1117,7 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 				// 应答经同一路径返回：样本是本路径干净的双向 RTT
 				s.mu.Lock()
 				r := time.Duration(s.sendTs()-pg.GetSendTs()) * time.Microsecond
-				p.noteRTT(r, time.Now())
+				p.noteRTT(r, time.Now(), pg.GetSendTs())
 				s.mu.Unlock()
 				continue
 			}
@@ -976,7 +1179,13 @@ func (s *Stream) freeAckedLocked(now time.Time) {
 		end := f.off + uint64(len(f.data))
 		if end <= s.cumAcked {
 			if f.path != nil {
-				f.path.onDelivered(len(f.data), now)
+				// sacked 段的 inflight 在被 SACK 覆盖时已释放，
+				// 此处只补记交付量，否则二次核销会把账本扣成负数。
+				if f.sacked {
+					f.path.creditDelivered(len(f.data), now)
+				} else {
+					f.path.onDelivered(len(f.data), now)
+				}
 			}
 			s.unackedSegs[0] = sendSeg{}
 			s.unackedSegs = s.unackedSegs[1:]
@@ -985,7 +1194,11 @@ func (s *Stream) freeAckedLocked(now time.Time) {
 		if f.off < s.cumAcked {
 			trim := s.cumAcked - f.off
 			if f.path != nil {
-				f.path.onDelivered(int(trim), now)
+				if f.sacked {
+					f.path.creditDelivered(int(trim), now)
+				} else {
+					f.path.onDelivered(int(trim), now)
+				}
 			}
 			f.data = f.data[trim:]
 			f.off = s.cumAcked

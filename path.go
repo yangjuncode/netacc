@@ -64,6 +64,21 @@ type path struct {
 	rxMarkT time.Time // 上个回报周期结束时刻
 	rxRate  float64   // 平滑后的到达速率估计（字节/秒）
 
+	// 软失效状态（#23，规格 §5.3）：名下在途段超过 k·srtt 仍未被
+	// ACK/SACK 覆盖即置 suspect，段被搬回重发池换路重发、路径本身
+	// 被调度降权（penalty 折算 effRate/inflightCap，见 scheduler.go）；
+	// 可疑态自 suspectSince 起持续超过 rto() 仍无活性证据（该路径
+	// 在标记之后发出的帧产生的回显，见 noteRTT）则按硬失效摘除。
+	suspect      bool
+	suspectSince time.Time
+	// suspectSinceTs 是 suspectSince 的发送时间戳（sendTs 域，µs）。
+	// 活性证据须晚于它才算数：被回显的 DATA/PING 必须是标记之后
+	// 发出的——旧拷贝的在途 ACK 回声会在标记后陆续到达，但它们
+	// 证明的只是「标记前发出的帧到了」，不能复活正在掉队的路径
+	// （否则死路径被陈旧证据反复复活、名下清空后再无段可重标，
+	// 永远挂着不被摘除）。
+	suspectSinceTs uint64
+
 	// 重传与降级记账（#25，Stats()/事件的数据源）：
 	// resentSegs/resentBytes 是本路径上重发出的段数与字节数
 	// （死路径遗留段换路后在本路径重新装帧下发时累加，见 trySend）；
@@ -79,6 +94,37 @@ type path struct {
 	// ---- 路径策略层记账（#24，同由所属 Stream.mu 保护）----
 	auto     bool      // 是否由自动策略补挂（保守摘除只动这类路径）
 	lowSince time.Time // 速率份额持续垫底起始时刻（policySnapshot 维护）
+}
+
+// suspectAfter 返回在途段的软失效判据：k·srtt（规格 §5.3，k 见
+// suspectK），下界 suspectFloor——无 RTT 样本或 loopback 级 srtt
+// 时，正常调度延迟也会让在途段「超时」，下界防止健康路径被误标。
+// 调用方须持有 Stream.mu。
+func (p *path) suspectAfter() time.Duration {
+	if d := suspectK * p.srtt; d > suspectFloor {
+		return d
+	}
+	return suspectFloor
+}
+
+// rto 返回路径 RTO：RFC 6298 风格 srtt+4·rttvar，下界
+// pathRTOFloor（与 RFC 6298 RTOmin=1s 同值，论证见常量注释）。
+// 调用方须持有 Stream.mu。
+func (p *path) rto() time.Duration {
+	if d := p.srtt + 4*p.rttvar; d > pathRTOFloor {
+		return d
+	}
+	return pathRTOFloor
+}
+
+// clearSuspectLocked 清除可疑标记与计时基线。调用方须持有
+// Stream.mu。谁能调用它、什么证据算「新鲜」，见 noteRTT 与
+// suspectSinceTs 的注释——证据必须能界在标记之后（回显的
+// DATA/PING 发送时刻晚于 suspectSinceTs），否则只是旧拷贝的
+// 回声在陆续到达。
+func (p *path) clearSuspectLocked() {
+	p.suspect = false
+	p.suspectSince = time.Time{}
 }
 
 // localAddr 返回本端地址（尽力而为：优先底层连接 multiaddr，退化 net.Addr）。
@@ -164,6 +210,10 @@ type PathInfo struct {
 	MinRTT   time.Duration // 最小 RTT（传播延迟基线）
 	EstRate  float64       // 速率估计（字节/秒，含对端 TELEMETRY 校准）
 	Inflight int           // 当前在途未确认字节数
+	// Suspect 为软失效可疑标记（规格 §5.3）：在途段超过 k·srtt
+	// 未被 ACK/SACK 覆盖即置位，路径被降权直至活性证据恢复
+	// 或 RTO 到期摘除；可供观测「路径正在掉队」的灰色状态。
+	Suspect bool
 }
 
 // ---------- PATH_ATTACH / PATH_DROP 帧体 ----------
@@ -350,6 +400,7 @@ func (p *path) info(now time.Time) PathInfo {
 		MinRTT:     p.minRTT,
 		EstRate:    p.effRate(now),
 		Inflight:   p.inflight,
+		Suspect:    p.suspect,
 	}
 }
 
