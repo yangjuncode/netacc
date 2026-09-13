@@ -2,9 +2,8 @@
 // 把一个对等点之间的多条网络路径叠加成一条高带宽逻辑流（聚合流），
 // 对应用呈现普通可靠有序字节流（net.Conn）语义。
 //
-// 本文件为 issue #16 的最小骨架：Aggregator 公开面 + /netacc/agg/1.0.0
-// 握手协议 + 单路径透传（握手流兼作第一条数据路径）。
-// 帧结构 / 多路径 / 调度器在后续 issue 实现。
+// 数据面帧结构（DATA/ACK + 重排缓冲 + 聚合窗口流控）由 #18 落地，
+// 见 stream.go / frame.go / reorder.go；多路径与调度器在后续 issue 实现。
 package netacc
 
 import (
@@ -40,6 +39,9 @@ type options struct {
 	acceptBacklog int
 	// handshakeTimeout：握手阶段超时；调用方 ctx 有 deadline 时以 ctx 为准。
 	handshakeTimeout time.Duration
+	// reorderMin / reorderMax：收端重排缓冲（连接级接收窗口）下界与硬顶，
+	// 容量 = clamp(Σest_rate·maxRTT, min, max)（规格书 §6）。
+	reorderMin, reorderMax int
 }
 
 // WithAcceptBacklog 设置等待 Accept 的入向握手流排队长度（默认 16）。
@@ -51,6 +53,19 @@ func WithAcceptBacklog(n int) Option {
 // 仅在调用方传入的 ctx 没有 deadline 时生效；设为 0 表示不加额外超时。
 func WithHandshakeTimeout(d time.Duration) Option {
 	return func(o *options) { o.handshakeTimeout = d }
+}
+
+// WithReorderBuffer 设置收端重排缓冲（连接级接收窗口）的上下界，
+// 默认 1MiB / 32MiB（规格书 §6）。容量取
+// clamp(Σest_rate·maxRTT, min, max)；min 建议不小于最大单路径 BDP，
+// max 是内存保护硬顶。min/max 非法（≤0 或 min>max）时收敛到默认。
+func WithReorderBuffer(min, max int) Option {
+	return func(o *options) {
+		if min <= 0 || max <= 0 || min > max {
+			return
+		}
+		o.reorderMin, o.reorderMax = min, max
+	}
 }
 
 // OpenOption 是 OpenStream 的逐调用选项（规格书 §8 的 opts...，逐调用覆盖构造默认）。
@@ -84,6 +99,8 @@ func New(h host.Host, opts ...Option) *Aggregator {
 		opts: options{
 			acceptBacklog:    16,
 			handshakeTimeout: defaultHandshakeTimeout,
+			reorderMin:       defaultMinReorderBuf,
+			reorderMax:       defaultMaxReorderBuf,
 		},
 	}
 	for _, o := range opts {
@@ -151,7 +168,12 @@ func (a *Aggregator) OpenStream(ctx context.Context, p peer.ID, opts ...OpenOpti
 		_ = s.Reset()
 		return nil, err
 	}
-	return newStream(id, s), nil
+	return newStream(id, s, a.streamCfg()), nil
+}
+
+// streamCfg 把 Aggregator 选项落到聚合流数据面参数。
+func (a *Aggregator) streamCfg() streamConfig {
+	return streamConfig{minBuf: a.opts.reorderMin, maxBuf: a.opts.reorderMax}
 }
 
 // Accept 接收一条对端发起的聚合流，完成握手应答后返回。
@@ -176,7 +198,7 @@ func (a *Aggregator) Accept(ctx context.Context) (*Stream, error) {
 				_ = s.Reset()
 				return nil, err
 			}
-			return newStream(id, s), nil
+			return newStream(id, s, a.streamCfg()), nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
