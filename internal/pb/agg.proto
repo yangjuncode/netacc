@@ -20,3 +20,26 @@ message Hello {
 message HelloAck {
   bytes agg_stream_id = 1;
 }
+
+// PathAttach 是 PATH_ATTACH 帧（帧类型 3）的 protobuf 帧体。
+//
+// 它是路径绑定子流（protocol /netacc/path/1.0.0）上的第一帧：加路径方
+// 在新子流上发出，凭 agg_stream_id 把该子流绑定到既有的聚合流
+// （连接级认证 + ID 绑定，规格书 §4.2）。接收方校验通过后回发一帧
+// 内容相同的 PATH_ATTACH 作为接受应答；agg_stream_id 不认识或
+// path_id 非法时直接 reset 子流。
+message PathAttach {
+  // 要绑定的聚合流标识（128bit）。
+  bytes agg_stream_id = 1;
+  // 加路径方分配的路径标识：最低位区分发起侧（0=聚合流发起方，
+  // 1=接收方），其余位为各侧单调递增计数——分侧命名空间保证
+  // 双向对称加路径时 path_id 不冲突（规格书 §4.3）。
+  uint64 path_id = 2;
+}
+
+// PathDrop 是 PATH_DROP 帧（帧类型 4）的 protobuf 帧体：告知对端
+// 摘除其对端视角下对应 path_id 的路径。尽力而为，无应答。
+message PathDrop {
+  // 待摘除路径的 path_id（即 PATH_ATTACH 时加路径方分配的标识）。
+  uint64 path_id = 1;
+}

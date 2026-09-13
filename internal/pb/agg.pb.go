@@ -116,6 +116,116 @@ func (x *HelloAck) GetAggStreamId() []byte {
 	return nil
 }
 
+// PathAttach 是 PATH_ATTACH 帧（帧类型 3）的 protobuf 帧体。
+//
+// 它是路径绑定子流（protocol /netacc/path/1.0.0）上的第一帧：加路径方
+// 在新子流上发出，凭 agg_stream_id 把该子流绑定到既有的聚合流
+// （连接级认证 + ID 绑定，规格书 §4.2）。接收方校验通过后回发一帧
+// 内容相同的 PATH_ATTACH 作为接受应答；agg_stream_id 不认识或
+// path_id 非法时直接 reset 子流。
+type PathAttach struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 要绑定的聚合流标识（128bit）。
+	AggStreamId []byte `protobuf:"bytes,1,opt,name=agg_stream_id,json=aggStreamId,proto3" json:"agg_stream_id,omitempty"`
+	// 加路径方分配的路径标识：最低位区分发起侧（0=聚合流发起方，
+	// 1=接收方），其余位为各侧单调递增计数——分侧命名空间保证
+	// 双向对称加路径时 path_id 不冲突（规格书 §4.3）。
+	PathId        uint64 `protobuf:"varint,2,opt,name=path_id,json=pathId,proto3" json:"path_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PathAttach) Reset() {
+	*x = PathAttach{}
+	mi := &file_internal_pb_agg_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PathAttach) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PathAttach) ProtoMessage() {}
+
+func (x *PathAttach) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_pb_agg_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PathAttach.ProtoReflect.Descriptor instead.
+func (*PathAttach) Descriptor() ([]byte, []int) {
+	return file_internal_pb_agg_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *PathAttach) GetAggStreamId() []byte {
+	if x != nil {
+		return x.AggStreamId
+	}
+	return nil
+}
+
+func (x *PathAttach) GetPathId() uint64 {
+	if x != nil {
+		return x.PathId
+	}
+	return 0
+}
+
+// PathDrop 是 PATH_DROP 帧（帧类型 4）的 protobuf 帧体：告知对端
+// 摘除其对端视角下对应 path_id 的路径。尽力而为，无应答。
+type PathDrop struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 待摘除路径的 path_id（即 PATH_ATTACH 时加路径方分配的标识）。
+	PathId        uint64 `protobuf:"varint,1,opt,name=path_id,json=pathId,proto3" json:"path_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PathDrop) Reset() {
+	*x = PathDrop{}
+	mi := &file_internal_pb_agg_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PathDrop) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PathDrop) ProtoMessage() {}
+
+func (x *PathDrop) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_pb_agg_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PathDrop.ProtoReflect.Descriptor instead.
+func (*PathDrop) Descriptor() ([]byte, []int) {
+	return file_internal_pb_agg_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *PathDrop) GetPathId() uint64 {
+	if x != nil {
+		return x.PathId
+	}
+	return 0
+}
+
 var File_internal_pb_agg_proto protoreflect.FileDescriptor
 
 const file_internal_pb_agg_proto_rawDesc = "" +
@@ -124,7 +234,13 @@ const file_internal_pb_agg_proto_rawDesc = "" +
 	"\x05Hello\x12\"\n" +
 	"\ragg_stream_id\x18\x01 \x01(\fR\vaggStreamId\".\n" +
 	"\bHelloAck\x12\"\n" +
-	"\ragg_stream_id\x18\x01 \x01(\fR\vaggStreamIdB+Z)github.com/yangjuncode/netacc/internal/pbb\x06proto3"
+	"\ragg_stream_id\x18\x01 \x01(\fR\vaggStreamId\"I\n" +
+	"\n" +
+	"PathAttach\x12\"\n" +
+	"\ragg_stream_id\x18\x01 \x01(\fR\vaggStreamId\x12\x17\n" +
+	"\apath_id\x18\x02 \x01(\x04R\x06pathId\"#\n" +
+	"\bPathDrop\x12\x17\n" +
+	"\apath_id\x18\x01 \x01(\x04R\x06pathIdB+Z)github.com/yangjuncode/netacc/internal/pbb\x06proto3"
 
 var (
 	file_internal_pb_agg_proto_rawDescOnce sync.Once
@@ -138,10 +254,12 @@ func file_internal_pb_agg_proto_rawDescGZIP() []byte {
 	return file_internal_pb_agg_proto_rawDescData
 }
 
-var file_internal_pb_agg_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_internal_pb_agg_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_internal_pb_agg_proto_goTypes = []any{
-	(*Hello)(nil),    // 0: netacc.v1.Hello
-	(*HelloAck)(nil), // 1: netacc.v1.HelloAck
+	(*Hello)(nil),      // 0: netacc.v1.Hello
+	(*HelloAck)(nil),   // 1: netacc.v1.HelloAck
+	(*PathAttach)(nil), // 2: netacc.v1.PathAttach
+	(*PathDrop)(nil),   // 3: netacc.v1.PathDrop
 }
 var file_internal_pb_agg_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for method output_type
@@ -162,7 +280,7 @@ func file_internal_pb_agg_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_pb_agg_proto_rawDesc), len(file_internal_pb_agg_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
