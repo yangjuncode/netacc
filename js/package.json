@@ -1,0 +1,82 @@
+{
+  "name": "netacc",
+  "version": "0.1.0",
+  "description": "netacc 的浏览器/TypeScript 客户端：基于 js-libp2p 的流级多路径带宽聚合，与 Go 端 github.com/yangjuncode/netacc 线格式互通",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/memory-stream.d.ts",
+      "import": "./dist/memory-stream.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@libp2p/circuit-relay-v2": "^4.2.0",
+    "@libp2p/interface": "^3.3.0",
+    "@libp2p/peer-id": "^6.0.0",
+    "@libp2p/webrtc": "^6.0.0",
+    "@libp2p/websockets": "^10.0.0",
+    "@libp2p/webtransport": "^6.0.0",
+    "@multiformats/multiaddr": "^13.0.0",
+    "libp2p": "^3.3.0",
+    "multiformats": "^14.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@libp2p/websockets": {
+      "optional": true
+    },
+    "@libp2p/webtransport": {
+      "optional": true
+    },
+    "@libp2p/webrtc": {
+      "optional": true
+    },
+    "@libp2p/circuit-relay-v2": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@chainsafe/libp2p-noise": "17.0.0",
+    "@chainsafe/libp2p-yamux": "8.0.1",
+    "@libp2p/interface": "3.3.0",
+    "@libp2p/peer-id": "6.0.15",
+    "@libp2p/tcp": "11.0.28",
+    "@multiformats/multiaddr": "13.0.3",
+    "@types/node": "^24.19.0",
+    "libp2p": "3.3.11",
+    "multiformats": "14.0.5",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "libp2p",
+    "multipath",
+    "bandwidth-aggregation",
+    "browser",
+    "p2p"
+  ],
+  "license": "MIT"
+}

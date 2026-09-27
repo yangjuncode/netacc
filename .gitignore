@@ -30,3 +30,7 @@ go.work.sum
 # Editor/IDE
 .idea/
 .vscode/
+
+# js/ 包（TypeScript 客户端）
+js/node_modules/
+js/dist/
