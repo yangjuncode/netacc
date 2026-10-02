@@ -235,6 +235,49 @@ func TestTunnelHTTPLocalHandler(t *testing.T) {
 	}
 }
 
+func TestTunnelHTTPLocalHandlerNoBodySemantics(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		status     int
+		writeEarly int
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "HEAD", method: http.MethodHead, status: http.StatusOK, wantStatus: http.StatusOK},
+		{name: "204", method: http.MethodGet, status: http.StatusNoContent, wantStatus: http.StatusNoContent},
+		{name: "304", method: http.MethodGet, status: http.StatusNotModified, wantStatus: http.StatusNotModified},
+		{name: "informational then final", method: http.MethodGet, writeEarly: http.StatusEarlyHints, wantStatus: http.StatusOK, wantBody: "body"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tt.writeEarly != 0 {
+					w.WriteHeader(tt.writeEarly)
+				}
+				if tt.status != 0 {
+					w.WriteHeader(tt.status)
+				}
+				_, _ = w.Write([]byte("body"))
+			})
+			acceptCh := appServer(t, serverConfig{httpHandler: h, openTimeout: defaultOpenTimeout})
+			sess, conn := dialTunnel(t, acceptCh)
+			defer conn.Close()
+			openHTTP(t, sess, &tunnelwire.OpenMsg{Target: "/body", Method: tt.method})
+			if err := sess.WriteEnd(); err != nil {
+				t.Fatalf("写请求 END 失败: %v", err)
+			}
+			res := readResult(t, sess)
+			if res.Status != tt.wantStatus {
+				t.Fatalf("status=%d, want=%d", res.Status, tt.wantStatus)
+			}
+			if body := string(readHTTPBody(t, sess)); body != tt.wantBody {
+				t.Fatalf("body=%q, want=%q", body, tt.wantBody)
+			}
+		})
+	}
+}
+
 // TestTunnelHTTPPostBody：POST 大 body（跨多个 DATA 帧）被
 // handler 完整读到；响应同样流式回来。
 func TestTunnelHTTPPostBody(t *testing.T) {

@@ -64,6 +64,29 @@ func TestAckFrameRoundTrip(t *testing.T) {
 	}
 }
 
+func TestValidateAckBoundsPeerClaims(t *testing.T) {
+	tests := []struct {
+		name string
+		f    frame
+		want bool
+	}{
+		{name: "cum beyond sent", f: frame{cum: 11, seq: 1}},
+		{name: "cum regresses", f: frame{cum: 4, seq: 1}},
+		{name: "range overlaps cumulative ack", f: frame{cum: 5, seq: 1, ranges: []byteRange{{5, 8}}}},
+		{name: "range beyond sent", f: frame{cum: 5, seq: 1, ranges: []byteRange{{6, 11}}}},
+		{name: "sequence jumps", f: frame{seq: maxAckSeqAdvance + 1}},
+		{name: "valid sack", f: frame{cum: 5, seq: 8, ranges: []byteRange{{7, 10}}}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateAck(tt.f, 10, 5, 7, true)
+			if (err == nil) != tt.want {
+				t.Fatalf("validateAck() err=%v, wantValid=%t", err, tt.want)
+			}
+		})
+	}
+}
+
 // TestCtrlFrameRoundTrip 验证控制帧（PATH_* 等预留类型）编码解码：type + body_len + body。
 func TestCtrlFrameRoundTrip(t *testing.T) {
 	body := []byte{0x0a, 0x10, 0xde, 0xad}

@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest'
 import { AggregatedStream, AGG_STREAM_ID_LEN } from '../src/stream.js'
 import { MemoryByteStream } from '../src/memory-stream.js'
-import { FrameDecoder, FrameType, encodeCtrlFrame, encodeDataFrame, type DecodedFrame } from '../src/frame.js'
+import { FrameDecoder, FrameType, encodeAckFrame, encodeCtrlFrame, encodeDataFrame, type DecodedFrame } from '../src/frame.js'
 import { StreamReader, type ByteStream } from '../src/bytestream.js'
 import { encodePathAttach, decodePathAttach } from '../src/proto.js'
 import { Path } from '../src/path.js'
@@ -135,6 +135,26 @@ describe('AggregatedStream 数据面（内存管道）', () => {
 		expect(ack.ranges).toEqual([{ start: 100, end: 110 }])
 		expect(ack.tsEcho).toBe(8888n)
 		await s.close()
+	})
+
+	it('拒绝会毒化 ACK 状态的超前序号与越界 SACK', async () => {
+		{
+			const { s, wire, frames } = rawPipe()
+			await recvFrame(frames) // 初始窗口通告
+			await wire.write(encodeAckFrame(0, 0, 0, 0, (1 << 20) + 1, []))
+			await expect(s.read()).rejects.toThrow(/ACK 协议违例/)
+		}
+		{
+			const { s, wire, frames } = rawPipe()
+			await recvFrame(frames) // 初始窗口通告
+			await wire.write(encodeAckFrame(0, 0, 0, 1024, 0, [])) // 打开发送窗口
+			await sleep(10)
+			await s.write(new Uint8Array(10))
+			const data = await recvFrame(frames)
+			expect(data.type).toBe(FrameType.Data)
+			await wire.write(encodeAckFrame(0, 0, 0, 0, 1, [{ start: 1, end: 11 }]))
+			await expect(s.read()).rejects.toThrow(/ACK 协议违例/)
+		}
 	})
 
 	it('窗口背压：对端不读时 write 挂起，读走后推进', async () => {

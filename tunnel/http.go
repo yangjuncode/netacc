@@ -247,7 +247,7 @@ func (s *Server) serveHTTPLocal(ctx context.Context, bc *bufferedConn, sess *tun
 	}
 	req = req.WithContext(hctx)
 
-	rw := newHTTPResultWriter(sess)
+	rw := newHTTPResultWriter(sess, method)
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -282,14 +282,15 @@ func contentLengthOf(h http.Header) int64 {
 // 之后 Write 走 DATA；handler 返回后由 finish 发 END。
 type httpResultWriter struct {
 	sess        *tunnelwire.Session
+	method      string
 	header      http.Header
 	status      int
 	wroteHeader bool
 	broken      bool // 写帧失败（对端断流等），后续写直接报错
 }
 
-func newHTTPResultWriter(sess *tunnelwire.Session) *httpResultWriter {
-	return &httpResultWriter{sess: sess, header: make(http.Header)}
+func newHTTPResultWriter(sess *tunnelwire.Session, method string) *httpResultWriter {
+	return &httpResultWriter{sess: sess, method: method, header: make(http.Header)}
 }
 
 func (w *httpResultWriter) Header() http.Header { return w.header }
@@ -297,6 +298,11 @@ func (w *httpResultWriter) Header() http.Header { return w.header }
 // WriteHeader 发 RESULT。重复调用与 net/http 语义一致：忽略。
 func (w *httpResultWriter) WriteHeader(code int) {
 	if w.wroteHeader {
+		return
+	}
+	// The tunnel protocol has one final RESULT and cannot represent interim
+	// informational responses. Ignore them so a later final status can win.
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
 		return
 	}
 	w.wroteHeader = true
@@ -317,6 +323,10 @@ func (w *httpResultWriter) Write(p []byte) (int, error) {
 	}
 	if w.broken {
 		return 0, net.ErrClosed
+	}
+	if w.method == http.MethodHead || (w.status >= 100 && w.status < 200) ||
+		w.status == http.StatusNoContent || w.status == http.StatusNotModified {
+		return len(p), nil
 	}
 	// WriteData 内部按 ≤64KiB 分帧且单次持锁，不与其它写者交错
 	if err := w.sess.WriteData(p); err != nil {

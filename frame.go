@@ -50,6 +50,9 @@ const (
 	// maxAckRanges 是单条 ACK 携带的 SACK 区间数上限。
 	// 只回告偏移最低的若干段——对重传决策最有价值的是靠近队头的洞。
 	maxAckRanges = 32
+	// maxAckSeqAdvance 容忍大量 ACK 重排/丢失，同时避免单个损坏序号
+	// 屏蔽之后的 ACK。
+	maxAckSeqAdvance = 1 << 20
 	// maxCtrlBody 是控制帧 protobuf 体的上限。
 	maxCtrlBody = 64 << 10
 )
@@ -57,6 +60,25 @@ const (
 // byteRange 是一个半开字节区间 [start, end)，用于 ACK 的 SACK ranges。
 type byteRange struct {
 	start, end uint64
+}
+
+func validateAck(f frame, sentOff, cumAcked, peerAckSeq uint64, gotPeerAck bool) error {
+	if f.cum < cumAcked || f.cum > sentOff {
+		return fmt.Errorf("ACK cum %d outside [%d,%d]", f.cum, cumAcked, sentOff)
+	}
+	prevSeq := uint64(0)
+	if gotPeerAck {
+		prevSeq = peerAckSeq
+	}
+	if f.seq < prevSeq || f.seq-prevSeq > maxAckSeqAdvance {
+		return fmt.Errorf("ACK seq %d exceeds accepted advance from %d", f.seq, prevSeq)
+	}
+	for _, r := range f.ranges {
+		if r.start <= f.cum || r.end > sentOff {
+			return fmt.Errorf("ACK range [%d,%d) outside (%d,%d]", r.start, r.end, f.cum, sentOff)
+		}
+	}
+	return nil
 }
 
 // frame 是解码后的一帧：按类型取用相应字段。

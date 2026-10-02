@@ -602,10 +602,9 @@ func TestResendSkipsSACKedRanges(t *testing.T) {
 		t.Fatalf("首个重发帧应为 F2 全段 [64k,128k)，得到 %+v", resent[0])
 	}
 
-	// 对端收下 F2 重发 + 早前 F3 → cum 推进到 192k，释放在途；
-	// 堆里仍持有 F4 前半 → SACK 继续上报 [192k,224k)
-	if _, err := c1b.Write(appendAckFrame(nil, 192<<10, 0, 0, 4<<20, 3,
-		[]byteRange{{192 << 10, 224 << 10}})); err != nil {
+	// 对端收下 F2 重发 + 早前 F3 + F4 前半 → cum 推进到 224k，释放在途。
+	// SACK 不能从 cum 开始，F4 前半现由累积确认覆盖。
+	if _, err := c1b.Write(appendAckFrame(nil, 224<<10, 0, 0, 4<<20, 3, nil)); err != nil {
 		t.Fatal(err)
 	}
 	// 第二帧应是 F4 按洞边界重切分的尾巴 [224k,256k)；
@@ -678,19 +677,27 @@ func TestUncoveredSegResentOnLivePath(t *testing.T) {
 	if _, err := s.Write(bytes.Repeat([]byte("d"), total)); err != nil {
 		t.Fatalf("Write 失败: %v", err)
 	}
-	// 收 3 个首发帧 F1/F2/F3，记下末帧时间戳用于 ACK 回显
-	var lastTs uint64
-	for n := 0; n < 3; {
+	// 收首批两个帧；初始在途额度用尽后确认 F1，释放额度让 F3 发出。
+	for n := 0; n < 2; {
 		if tf := recvTyped(t, sink); tf.ft == frameData {
-			lastTs = tf.f.sendTs
 			n++
+		}
+	}
+	if _, err := c1b.Write(appendAckFrame(nil, 64<<10, 0, 0, 4<<20, 2, nil)); err != nil {
+		t.Fatal(err)
+	}
+	var lastTs uint64
+	for {
+		if tf := recvTyped(t, sink); tf.ft == frameData && tf.f.off == 128<<10 {
+			lastTs = tf.f.sendTs
+			break
 		}
 	}
 	// 对端视图：F1 按序交付（cum=64k）、F3 已入堆（SACK），
 	// F2 的到达副本被缓冲 cap 丢弃（既不进 cum 也不进 SACK）。
 	// ACK 回显 F3 的 ts（ts_path=1 即对端视角的 path0）——等价于
 	// 「F3 的到达副本被收下」，给 path0 一个真实 RTT 样本。
-	if _, err := c1b.Write(appendAckFrame(nil, 64<<10, lastTs, 1, 4<<20, 2,
+	if _, err := c1b.Write(appendAckFrame(nil, 64<<10, lastTs, 1, 4<<20, 3,
 		[]byteRange{{128 << 10, 192 << 10}})); err != nil {
 		t.Fatal(err)
 	}
@@ -734,7 +741,7 @@ func TestUncoveredSegResentOnLivePath(t *testing.T) {
 drained:
 	// 对端最终收下重发的 F2 → cum 全覆盖 → 静默期内不再重发。
 	// 先等一拍结算：覆盖瞬间仍可能有刚发出的在途重发副本落地。
-	if _, err := c1b.Write(appendAckFrame(nil, total, lastTs, 1, 4<<20, 3, nil)); err != nil {
+	if _, err := c1b.Write(appendAckFrame(nil, total, lastTs, 1, 4<<20, 4, nil)); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -848,7 +855,12 @@ func TestPathKillResendOnSurviving(t *testing.T) {
 	_ = c2b.Close()
 
 	// 数据全部到达：未确认段经 path0 换路重传补齐
-	got := <-rdone
+	var got []byte
+	select {
+	case got = <-rdone:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("杀路径后数据未收全: sa=%+v sb=%+v want=%d", sa.Stats(), sb.Stats(), len(want))
+	}
 	if !bytes.Equal(got, want) {
 		t.Fatal("杀路径后数据丢失或不保序")
 	}

@@ -35,6 +35,7 @@ import {
 	FrameDecoder,
 	FrameType,
 	MAX_ACK_RANGES,
+	MAX_ACK_SEQ_ADVANCE,
 	MAX_FRAME_PAYLOAD,
 	encodeAckFrame,
 	encodeCtrlFrame,
@@ -1078,6 +1079,11 @@ export class AggregatedStream implements AsyncIterable<Uint8Array> {
 				if (this.gotPeerAck && f.seq <= this.peerAckSeq) {
 					return false
 				}
+				const err = validateAck(f, this.sentOff, this.cumAcked, this.peerAckSeq, this.gotPeerAck)
+				if (err !== null) {
+					this.dropPath(p, netaccErr('protocol', `netacc: ACK 协议违例: ${err.message}`), true)
+					return true
+				}
 				this.peerAckSeq = f.seq
 				this.gotPeerAck = true
 				const now = performance.now()
@@ -1089,11 +1095,7 @@ export class AggregatedStream implements AsyncIterable<Uint8Array> {
 						q.noteRTT(rMs, now, Number(f.tsEcho))
 					}
 				}
-				// 防御：对端不应确认未发送的字节；谎报时收敛到已发边界
-				let cum = f.cum
-				if (cum > this.sentOff) {
-					cum = this.sentOff
-				}
+				const cum = f.cum
 				if (cum > this.cumAcked) {
 					this.cumAcked = cum
 					this.freeAcked(now)
@@ -1517,6 +1519,28 @@ function normalizeRanges(rs: ByteRange[]): ByteRange[] {
 		out.push(r)
 	}
 	return out
+}
+
+function validateAck(
+	f: DecodedFrame,
+	sentOff: number,
+	cumAcked: number,
+	peerAckSeq: number,
+	gotPeerAck: boolean,
+): Error | null {
+	if (f.cum < cumAcked || f.cum > sentOff) {
+		return new Error(`ACK cum ${f.cum} outside [${cumAcked},${sentOff}]`)
+	}
+	const prevSeq = gotPeerAck ? peerAckSeq : 0
+	if (f.seq < prevSeq || f.seq - prevSeq > MAX_ACK_SEQ_ADVANCE) {
+		return new Error(`ACK seq ${f.seq} exceeds accepted advance from ${prevSeq}`)
+	}
+	for (const r of f.ranges) {
+		if (r.start <= f.cum || r.end > sentOff) {
+			return new Error(`ACK range [${r.start},${r.end}) outside (${f.cum},${sentOff}]`)
+		}
+	}
+	return null
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
