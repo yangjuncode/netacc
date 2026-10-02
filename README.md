@@ -269,7 +269,88 @@ netacc server -listen /ip4/0.0.0.0/tcp/4001 -upstream 127.0.0.1:80
 
 netacc client -server /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW... -listen-port 8080
 # 之后访问 <client 主机>:8080 即等于访问 server 侧的 127.0.0.1:80
+
+# HTTP/WS 隧道 server：相对路径走内建 echo handler；绝对 URL 由 allowlist 代理。
+netacc server -listen /ip4/0.0.0.0/tcp/4001 \
+  -tunnel-http-echo -tunnel-ws-echo \
+  -tunnel-allow https://api.example.com -tunnel-allow wss://events.example.com
 ```
+
+## HTTP/WebSocket 隧道（Go + TypeScript）
+
+`tunnel.Server` 还可以在同一条聚合流上运行 `tunnelwire` 应用层协议（见 `docs/spec/tunnel-http-ws.md`）：client 先写 `NTUN\x01`，server 据此把该流分流到 HTTP/WS 处理器；没有 magic 的流仍走 `WithUpstream` 的 raw TCP 桥接，两种模式可共存。
+
+### Go client
+
+```go
+// HTTP：相对路径交给 server 本地 handler；绝对 http/https URL 走代理。
+req, _ := http.NewRequest(http.MethodPost, "/api/users", strings.NewReader(`{"name":"x"}`))
+req.Header.Set("Content-Type", "application/json")
+resp, err := agga.TunnelFetch(ctx, serverPeer, req)
+if err == nil {
+	defer resp.Body.Close()
+}
+
+// WebSocket：相对路径走本地 TunnelWSHandler；ws/wss 绝对 URL 走代理。
+ws, err := agga.TunnelWS(ctx, serverPeer, "/ws", nil, []string{"chat"})
+if err == nil {
+	defer ws.Close(1000, "")
+	_ = ws.WriteMessage(netacc.TunnelWSText, []byte("hello"))
+}
+```
+
+### Go server
+
+```go
+allowAPI := func(p peer.ID, kind tunnel.TunnelKind, u *url.URL) bool {
+	return kind == tunnel.TunnelKindHTTP && u.Host == "api.internal:443"
+}
+
+srv, _ := tunnel.NewServer(aggb,
+	// 相对路径 -> 本地 handler。
+	tunnel.WithTunnelHTTPHandler(apiMux),
+	tunnel.WithTunnelWSHandler(tunnel.TunnelWSHandlerFunc(wsHandler)),
+
+	// 绝对 URL -> 代理；Allow=nil 默认拒绝，防开放代理。
+	tunnel.WithTunnelHTTPProxy(tunnel.HTTPProxyConfig{Allow: allowAPI}),
+	tunnel.WithTunnelWSProxy(tunnel.WSProxyConfig{Allow: allowWS}),
+
+	// 可选：没有 NTUN\x01 magic 的旧客户端仍桥接固定 TCP 上游。
+	tunnel.WithUpstream("127.0.0.1:80"),
+)
+go srv.Run(ctx)
+```
+
+本地 WS handler 先通过 `conn.Request()` 查看目标/headers/子协议，再调用 `conn.Accept(protocol)` 或 `conn.Reject(status, msg)`；接受后用 `ReadMessage`/`WriteMessage`/`Ping`/`Close` 处理消息。
+
+### TypeScript / 浏览器 client
+
+```ts
+const client = new NetaccClient(node, {
+  tunnelTarget: '/dns4/tunnel.example.com/tcp/443/wss/p2p/12D3KooW…',
+})
+
+// 相对路径：server 本地 HTTP handler。
+const res = await client.tunnelFetch('/api/users')
+
+// 绝对 URL：server 代访问（需命中 server 的 allowlist）。
+const proxyRes = await client.tunnelFetch('https://api.internal/users')
+
+// WebSocket-like EventTarget；opened 可等待握手结果。
+const ws = client.tunnelWs('/ws', { protocols: ['chat'] })
+await ws.opened
+ws.send('hello')
+ws.onmessage = ev => console.log(ev.data)
+```
+
+也可以逐调用指定 server：`client.tunnelFetchTo(serverAddr, input, init)` / `client.tunnelWsTo(serverAddr, url, init)`。
+
+注意：
+
+- 每条 HTTP 请求和每条 WS 会话各对应一条聚合流；请求体/响应体均支持流式传输。
+- `tunnelFetch` 的 HTTP 4xx/5xx 会正常返回 `Response`；协议错误、建流失败或 `signal` 中止才 reject。
+- `tunnelWs` 返回 `TunnelWebSocket`（WebSocket-like，不是真实 DOM WebSocket）；握手拒绝会触发 `error`/`close` 并让 `opened` reject。
+- server 代理绝对 URL 时必须配置 `Allow` 过滤器；`nil` 默认拒绝，防止把隧道出口变成开放代理。
 
 ## 已知限制
 
@@ -286,4 +367,4 @@ go build ./... && go vet ./...
 go test -race -count=1 ./...
 ```
 
-设计规格在 `docs/spec/bandwidth-aggregation.md`；issue 用 GitHub issues 跟踪（`docs/agents/`）。欢迎 issue 与 PR。
+设计规格在 `docs/spec/bandwidth-aggregation.md` 与 `docs/spec/tunnel-http-ws.md`；issue 用 GitHub issues 跟踪（`docs/agents/`）。欢迎 issue 与 PR。

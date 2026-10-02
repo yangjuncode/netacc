@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -197,8 +198,8 @@ func TestNewClientValidation(t *testing.T) {
 	}
 }
 
-// TestNewServerValidation：nil accepter、缺/非法 upstream 都应在
-// NewServer 阶段报错。
+// TestNewServerValidation：nil accepter、无任何服务配置、非法 upstream
+// 都应在 NewServer 阶段报错；仅隧道配置（无 upstream）合法。
 func TestNewServerValidation(t *testing.T) {
 	accepter := fakeAccepter{}
 
@@ -222,6 +223,24 @@ func TestNewServerValidation(t *testing.T) {
 		if _, err := NewServer(accepter, WithUpstream(addr)); err != nil {
 			t.Fatalf("合法上游 %q 不应报错: %v", addr, err)
 		}
+	}
+
+	// upstream 为空但配置了隧道处理器/代理：合法
+	if _, err := NewServer(accepter,
+		WithTunnelHTTPHandler(http.NotFoundHandler())); err != nil {
+		t.Fatalf("仅配 HTTP handler 应合法: %v", err)
+	}
+	if _, err := NewServer(accepter,
+		WithTunnelHTTPProxy(HTTPProxyConfig{})); err != nil {
+		t.Fatalf("仅配 HTTP 代理应合法: %v", err)
+	}
+	if _, err := NewServer(accepter,
+		WithTunnelWSHandler(TunnelWSHandlerFunc(func(*netacc.TunnelWSConn) {}))); err != nil {
+		t.Fatalf("仅配 WS handler 应合法: %v", err)
+	}
+	if _, err := NewServer(accepter,
+		WithTunnelWSProxy(WSProxyConfig{})); err != nil {
+		t.Fatalf("仅配 WS 代理应合法: %v", err)
 	}
 }
 
@@ -474,7 +493,7 @@ func TestClientEOFPropagates(t *testing.T) {
 func TestServerStreamToUpstream(t *testing.T) {
 	upstream := echoUpstream(t, "BANNER\n")
 	acceptCh := make(chan net.Conn, 4)
-	srv := newServer(chanAccepter(acceptCh), upstream)
+	srv := newServer(chanAccepter(acceptCh), serverConfig{upstream: upstream, openTimeout: defaultOpenTimeout})
 	runServer(t, srv)
 
 	a, b := net.Pipe()
@@ -508,7 +527,7 @@ func TestServerStreamToUpstream(t *testing.T) {
 func TestServerConcurrentStreams(t *testing.T) {
 	upstream := echoUpstream(t, "")
 	acceptCh := make(chan net.Conn, 4)
-	srv := newServer(chanAccepter(acceptCh), upstream)
+	srv := newServer(chanAccepter(acceptCh), serverConfig{upstream: upstream, openTimeout: defaultOpenTimeout})
 	runServer(t, srv)
 
 	var wgCh = make(chan net.Conn, 2)
@@ -547,7 +566,7 @@ func TestServerUpstreamDialFailure(t *testing.T) {
 	_ = ln.Close()
 
 	acceptCh := make(chan net.Conn, 4)
-	srv := newServer(chanAccepter(acceptCh), dead)
+	srv := newServer(chanAccepter(acceptCh), serverConfig{upstream: dead, openTimeout: defaultOpenTimeout})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -583,7 +602,7 @@ func TestServerUpstreamDialFailure(t *testing.T) {
 func TestServerCancelClosesStreams(t *testing.T) {
 	upstream := echoUpstream(t, "")
 	acceptCh := make(chan net.Conn, 4)
-	srv := newServer(chanAccepter(acceptCh), upstream)
+	srv := newServer(chanAccepter(acceptCh), serverConfig{upstream: upstream, openTimeout: defaultOpenTimeout})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -638,7 +657,7 @@ func TestServerEOFPropagates(t *testing.T) {
 	}()
 
 	acceptCh := make(chan net.Conn, 4)
-	srv := newServer(chanAccepter(acceptCh), ln.Addr().String())
+	srv := newServer(chanAccepter(acceptCh), serverConfig{upstream: ln.Addr().String(), openTimeout: defaultOpenTimeout})
 	runServer(t, srv)
 
 	a, b := net.Pipe()

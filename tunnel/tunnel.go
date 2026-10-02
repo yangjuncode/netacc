@@ -1,16 +1,17 @@
-// Package tunnel 在 netacc 聚合流之上提供 TCP 端口映射：
-// 对外是普通 TCP 监听端口，对内每条连接走一条聚合流到达对端，
-// 由对端转发到固定的上游 TCP 服务——经典的「端口转发/隧道」形态。
+// Package tunnel 在 netacc 聚合流之上提供两类隧道能力：
 //
-// 角色分工：
-//   - Client（隧道入口）：在 0.0.0.0:<port> 监听 TCP，每接入一条
-//     连接就向固定 server peer 开一条聚合流，然后双向转发；
-//   - Server（隧道出口）：Accept 聚合流，每条拨向固定的上游
-//     host:port，然后双向转发。
+//  1. TCP 端口映射：对外是普通 TCP 监听端口，对内每条连接走一条聚合流
+//     到达对端，由对端转发到固定的上游 TCP 服务——经典的
+//     「端口转发/隧道」形态。一条 TCP 连接对应一条聚合流，互不影响；
+//     上游地址只由 Server 的 WithUpstream 固定配置。
+//  2. HTTP/WebSocket 应用层隧道：带 "NTUN\x01" magic 的聚合流按
+//     docs/spec/tunnel-http-ws.md 的 tunnelwire 帧协议承载一次 HTTP
+//     请求或一条 WS 会话；相对路径交给本地 handler，绝对 URL 交给
+//     allowlist 控制的 HTTP/WS 代理。
 //
-// 一条 TCP 连接对应一条聚合流，互不影响，天然支持并发。
-// 上游地址只由 Server 的 WithUpstream 固定配置——client 不能指定
-// 上游，聚合线协议上也没有「选上游」的消息。
+// Client.Run 只负责 raw TCP 端口映射；TunnelFetch/TunnelWS 是 root
+// netacc.Aggregator 上的客户端 API。Server 可同时配置 WithUpstream
+// 与应用层隧道选项，按流前缀 magic 自动分流。
 //
 // 明确不支持 TCP 半关闭：任一向 io.Copy 返回（EOF/出错）即视为
 // 会话结束，立即关闭两端连接并等待另一向退出。聚合流没有

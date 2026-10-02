@@ -32,6 +32,8 @@ import {
 import { Path } from './path.js'
 import { netaccErr } from './types.js'
 import { transportOf } from './multiaddr.js'
+import { tunnelFetch as tunnelFetchCore, type TunnelFetchInit } from './tunnel-http.js'
+import { tunnelWs as tunnelWsCore, type TunnelWebSocket, type TunnelWSInit } from './tunnel-ws.js'
 
 /** 聚合流握手协议号（兼首条数据路径）。 */
 export const PROTOCOL_AGG = '/netacc/agg/1.0.0'
@@ -40,6 +42,9 @@ export const PROTOCOL_PATH = '/netacc/path/1.0.0'
 
 const DEFAULT_ACCEPT_BACKLOG = 16
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 60_000
+
+/** StreamTarget：openStream/tunnelFetchTo/tunnelWsTo 支持的对端寻址形态。 */
+export type StreamTarget = PeerId | Multiaddr | Multiaddr[] | string
 
 export interface NetaccClientOptions {
 	/** 待 accept 的入向握手流排队长度（默认 16）。 */
@@ -72,6 +77,11 @@ export interface NetaccClientOptions {
 	 * 聚合协议明确需要中继路径能力，默认 true。
 	 */
 	runOnLimitedConnection?: boolean
+	/**
+	 * tunnelFetch/tunnelWs 一参数形式的默认 server 对端。
+	 * 未设置时这两个方法抛错，请改用 tunnelFetchTo/tunnelWsTo 显式指定。
+	 */
+	tunnelTarget?: StreamTarget
 }
 
 /** OpenStreamOptions 是单次 openStream 的生效配置（逐调用覆盖构造默认）。 */
@@ -108,7 +118,7 @@ function idKey(id: Uint8Array): string {
  * 把 openStream 目标转成 libp2p DialTarget：
  * PeerId | Multiaddr | Multiaddr[] | 字符串（'/...' → multiaddr，否则 peerID）。
  */
-function toDialTarget(target: PeerId | Multiaddr | Multiaddr[] | string): PeerId | Multiaddr | Multiaddr[] {
+function toDialTarget(target: StreamTarget): PeerId | Multiaddr | Multiaddr[] {
 	if (typeof target === 'string') {
 		if (target.startsWith('/')) {
 			return multiaddr(target)
@@ -170,7 +180,7 @@ export class NetaccClient {
 	 * 数组或字符串。minPaths>1 时用 peerStore 地址继续直拨补挂。
 	 */
 	async openStream(
-		target: PeerId | Multiaddr | Multiaddr[] | string,
+		target: StreamTarget,
 		options?: OpenStreamOptions,
 	): Promise<AggregatedStream> {
 		await this.registration
@@ -259,6 +269,45 @@ export class NetaccClient {
 				throw netaccErr('min_paths', `netacc: 补挂路径后仍只有 ${st.paths().length} 条，不满足 minPaths(${n})`)
 			}
 		}
+	}
+
+	// ---------- tunnel（HTTP/WS over 聚合流） ----------
+
+	/**
+	 * tunnelFetch：经构造默认的 tunnelTarget 发一次 HTTP 请求
+	 * （等价 tunnelFetchTo(this.opts.tunnelTarget, input, init)）。
+	 * input 为 '/path'（server 本地 handler）或 http(s):// 绝对 URL（代理）。
+	 */
+	tunnelFetch(input: string | URL, init?: TunnelFetchInit): Promise<Response> {
+		return this.tunnelFetchTo(this.requireTunnelTarget(), input, init)
+	}
+
+	/** tunnelFetchTo：向指定对端发一次 HTTP-over-tunnel 请求。 */
+	tunnelFetchTo(target: StreamTarget, input: string | URL, init?: TunnelFetchInit): Promise<Response> {
+		// 薄 wrapper：会话逻辑在 tunnel-http.ts，这里只注入 openStream
+		return tunnelFetchCore(opts => this.openStream(target, opts), input, init)
+	}
+
+	/**
+	 * tunnelWs：经构造默认的 tunnelTarget 建一条 WebSocket-over-tunnel
+	 * 会话（等价 tunnelWsTo(this.opts.tunnelTarget, url, init)）。
+	 * url 为 '/path'（server 本地 WS handler）或 ws(s):// 绝对 URL（代理）。
+	 */
+	tunnelWs(url: string | URL, init?: TunnelWSInit): TunnelWebSocket {
+		return this.tunnelWsTo(this.requireTunnelTarget(), url, init)
+	}
+
+	/** tunnelWsTo：向指定对端建 WebSocket-over-tunnel，立即返回 CONNECTING 态对象。 */
+	tunnelWsTo(target: StreamTarget, url: string | URL, init?: TunnelWSInit): TunnelWebSocket {
+		return tunnelWsCore(opts => this.openStream(target, opts), url, init)
+	}
+
+	private requireTunnelTarget(): StreamTarget {
+		const t = this.opts.tunnelTarget
+		if (t === undefined) {
+			throw netaccErr('internal', 'netacc: 未配置 tunnelTarget，请改用 tunnelFetchTo/tunnelWsTo 显式指定对端')
+		}
+		return t
 	}
 
 	// ---------- 入向 ----------

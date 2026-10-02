@@ -33,6 +33,14 @@ _Avoid_: relay server、中转服务器
 描述一条待建路径的信息单元，由聚合协议的控制消息携带：直连路径为传输偏好与目标 multiaddr，中继路径为中继节点 peerID 与逐跳传输偏好。
 _Avoid_: 路径配置
 
+**应用层隧道 (Tunnelwire Session)**:
+跑在一条聚合流上的 HTTP/WebSocket 会话协议；流前缀 magic 与自定义帧定义见 `docs/spec/tunnel-http-ws.md`。一条 HTTP 请求或一条 WS 会话对应一条聚合流。
+_Avoid_: HTTP 多路复用、隧道子流
+
+**隧道目标 (Tunnel Target)**:
+`tunnelFetch`/`tunnelWs` 请求的应用层目标：`/path` 表示 server 本地 handler，`http(s)://`/`ws(s)://` 绝对 URL 表示 server 代理目标。
+_Avoid_: upstream、上游地址
+
 ### 内部机制
 
 **调度器 (Scheduler)**:
