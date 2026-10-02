@@ -230,6 +230,47 @@ r, err := netaccrelay.New(h,
 - **公平限速**：token-bucket 传输装饰器，逐 peer 桶按需激活；分配器按「本拍等待需求」做 max-min 重分配（不惩罚沉默 peer，不保分低需求者）
 - `WithBandwidth`/`WithAllocatorOptions`（`WithRecomputeInterval`/`WithBurst`/`WithMinShare`）/`WithResources`/`WithRelayOptions` 细调
 
+## 端口映射（tunnel 子包）
+
+`github.com/yangjuncode/netacc/tunnel` 在聚合流之上提供经典 TCP 端口映射：server 端把每条聚合流桥接到固定上游 TCP 服务，client 端把监听端口上的每条 TCP 连接经一条新建聚合流桥接到 server peer——**一条 TCP 连接对应一条聚合流**，并发连接互不影响。
+
+```go
+import (
+	"github.com/yangjuncode/netacc"
+	"github.com/yangjuncode/netacc/tunnel"
+)
+
+// server 侧（隧道出口）：Accept 聚合流 → 拨固定上游后双向转发。
+// 上游只能由 server 配置，client 不可指定（协议上也没有选上游的消息）。
+srv, _ := tunnel.NewServer(aggB, tunnel.WithUpstream("127.0.0.1:80"))
+go srv.Run(ctx)
+
+// client 侧（隧道入口）：每条接入的 TCP 连接向 server peer 开一条聚合流。
+cli, _ := tunnel.NewClient(aggA, serverPeerID,
+	tunnel.WithListenPort(8080),
+	tunnel.WithOpenOptions(netacc.WithMinPaths(2)), // 可选：透传 OpenStream 逐调用选项
+)
+go cli.Run(ctx)
+```
+
+注意：
+
+- **client 监听地址固定 `0.0.0.0:<port>`**——对公网/局域网可达；只想本机使用请自行限制（防火墙/反代）。`WithListenPort(0)` 由内核分配端口，`cli.Addr()` 取实际地址。
+- **不支持 TCP 半关闭**：任一向拷贝结束（EOF/出错）即关闭两端连接——聚合流无 `CloseWrite` 语义。
+- 生命周期：`Run(ctx)` 阻塞服务；ctx 取消时停 listener/Accept、断开全部活动连接与聚合流、等处理协程退出后返回 `nil`。建流/拨上游的单次失败只影响该条连接，不打断服务循环。
+
+### 命令行
+
+```bash
+go build -o netacc ./cmd/netacc
+
+netacc server -listen /ip4/0.0.0.0/tcp/4001 -upstream 127.0.0.1:80
+# 输出 PeerID 与含 /p2p/<peerID> 的监听地址
+
+netacc client -server /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW... -listen-port 8080
+# 之后访问 <client 主机>:8080 即等于访问 server 侧的 127.0.0.1:80
+```
+
 ## 已知限制
 
 - **A→C 传输偏好尽力而为**：上游 circuitv2 client 复用既有连接时偏好可能退化；无既有连接时确定性命中
