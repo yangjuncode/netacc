@@ -28,6 +28,8 @@ export enum FrameType {
 export const MAX_FRAME_PAYLOAD = 64 << 10 // DATA 载荷上限 64KiB
 export const MAX_ACK_RANGES = 32 // ACK SACK 区间数上限
 export const MAX_CTRL_BODY = 64 << 10 // 控制帧 protobuf 体上限
+/** 最大可接受的 ACK 序号跃迁，容忍大量丢包同时限制损坏序号。 */
+export const MAX_ACK_SEQ_ADVANCE = 1 << 20
 
 /** byteRange 是半开字节区间 [start, end)，用于 ACK 的 SACK ranges。 */
 export interface ByteRange {

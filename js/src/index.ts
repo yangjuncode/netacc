@@ -19,8 +19,44 @@
  */
 
 export { NetaccClient } from './client.js'
-export type { NetaccClientOptions, OpenStreamOptions } from './client.js'
+export type { NetaccClientOptions, OpenStreamOptions, StreamTarget } from './client.js'
 export { PROTOCOL_AGG, PROTOCOL_PATH } from './client.js'
+
+export { tunnelFetch, parseHttpTarget } from './tunnel-http.js'
+export type { TunnelFetchBody, TunnelFetchInit } from './tunnel-http.js'
+export { tunnelWs, parseWsTarget, TunnelWebSocket } from './tunnel-ws.js'
+export type { TunnelCloseEvent, TunnelWSData, TunnelWSInit } from './tunnel-ws.js'
+export {
+	TUNNEL_MAGIC,
+	TunnelFrameType,
+	TunnelFrameReader,
+	TunnelSession,
+	abortCodeOf,
+	decodeAbort,
+	decodeJson,
+	decodeResult,
+	decodeWsClose,
+	encodeJson,
+	encodeTunnelFrame,
+	gracefulClose,
+	normalizeHeaders,
+	MAX_TUNNEL_DATA,
+	MAX_TUNNEL_JSON,
+	MAX_TUNNEL_URL,
+	MAX_TUNNEL_WS_MESSAGE,
+	WS_OPCODE_BINARY,
+	WS_OPCODE_TEXT,
+} from './tunnel-wire.js'
+export type {
+	TunnelAbortMsg,
+	TunnelFrame,
+	TunnelOpenMsg,
+	TunnelOpenOptions,
+	TunnelResultMsg,
+	TunnelStream,
+	TunnelStreamOpener,
+	TunnelWsCloseMsg,
+} from './tunnel-wire.js'
 
 export { AggregatedStream, AGG_STREAM_ID_LEN } from './stream.js'
 export type {

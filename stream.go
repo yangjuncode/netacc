@@ -1075,6 +1075,11 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 				s.mu.Unlock()
 				continue
 			}
+			if err := validateAck(f, s.sentOff, s.cumAcked, s.peerAckSeq, s.gotPeerAck); err != nil {
+				s.mu.Unlock()
+				s.dropPath(p, fmt.Errorf("netacc: ACK 协议违例: %w", err), true)
+				return
+			}
 			s.peerAckSeq = f.seq
 			s.gotPeerAck = true
 			now := time.Now()
@@ -1086,11 +1091,6 @@ func (s *Stream) recvLoop(p *path, fr *frameReader) {
 					r := time.Duration(s.sendTs()-f.tsEcho) * time.Microsecond
 					q.noteRTT(r, now, f.tsEcho)
 				}
-			}
-			// 防御：对端不应确认未发送的字节；谎报时收敛到已发边界，
-			// 防 sentOff-cumAcked 下溢成天文数字
-			if f.cum > s.sentOff {
-				f.cum = s.sentOff
 			}
 			if f.cum > s.cumAcked {
 				s.cumAcked = f.cum

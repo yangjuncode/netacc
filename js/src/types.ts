@@ -27,6 +27,8 @@ export type NetaccErrorCode =
 	| 'no_paths' // 存活路径归零后的流终态
 	| 'reset' // 流被对端 RST
 	| 'timeout' // 操作超时（握手/读写 deadline）
+	| 'protocol' // 隧道协议违例（帧类型/JSON/方向不符约定）
+	| 'peer_abort' // 隧道会话被对端 ABORT 帧终止
 	| 'internal'
 
 export const ErrClosed = { code: 'closed' as const }

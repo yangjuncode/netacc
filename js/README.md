@@ -58,6 +58,40 @@ await st.close()
 const incoming = await client.accept()
 ```
 
+## HTTP/WebSocket 隧道
+
+`NetaccClient` 内置 `tunnelwire` 应用层协议（见仓库 `docs/spec/tunnel-http-ws.md`），可把网页中的 HTTP/WS 请求经聚合流送到 Go `tunnel.Server`：
+
+```ts
+const client = new NetaccClient(node, {
+  tunnelTarget: '/dns4/tunnel.example.com/tcp/443/wss/p2p/12D3KooW…',
+})
+
+// 相对路径：由 server 的 WithTunnelHTTPHandler 处理。
+const res = await client.tunnelFetch('/api/users')
+
+// 绝对 http/https URL：由 server 的 HTTP proxy 代访问（默认须命中 allowlist）。
+const upstream = await client.tunnelFetch('https://api.internal/users')
+
+// 相对路径：由 server 的 WithTunnelWSHandler 处理；ws/wss URL 走 WS proxy。
+const ws = client.tunnelWs('/ws', { protocols: ['chat'] })
+await ws.opened
+ws.send('hello')
+ws.onmessage = ev => console.log(ev.data)
+ws.close(1000)
+```
+
+也可以逐请求指定 server：
+
+```ts
+await client.tunnelFetchTo(serverAddr, '/api/users')
+const ws = client.tunnelWsTo(serverAddr, 'wss://api.internal/events')
+```
+
+`tunnelFetch` 支持 `method`/`headers`/`body`/`signal`/`openOptions`；body 可以是字符串、字节、Blob、URLSearchParams 或 `ReadableStream<Uint8Array>`。HTTP 4xx/5xx 返回正常 `Response`，协议错误和对端 ABORT 才 reject。
+
+`TunnelWebSocket` 是 WebSocket-like `EventTarget`：`readyState`、`send()`、`close()`、`onopen`/`onmessage`/`onerror`/`onclose`、`binaryType`、`protocol`、`bufferedAmount`；`opened` Promise 用来等待握手成功。它不是浏览器原生 `WebSocket`，相对路径与 `ws(s)://` 代理由 tunnel server 解释。
+
 ## js-libp2p 传输配置
 
 聚合路径的传输能力 = node 的 transport 配置。`addPath(addr)`/`openStream(addr)` 直接吃对应的 multiaddr 形态：
@@ -132,6 +166,10 @@ class NetaccClient {
   openStream(target, options?): Promise<AggregatedStream>
   accept(options?): Promise<AggregatedStream>
   onStream(handler): () => void
+  tunnelFetch(input, init?): Promise<Response>
+  tunnelFetchTo(target, input, init?): Promise<Response>
+  tunnelWs(url, init?): TunnelWebSocket
+  tunnelWsTo(target, url, init?): TunnelWebSocket
   close(): Promise<void>
 }
 ```
@@ -163,4 +201,4 @@ npm run build       # 产出 dist/
 npm test            # vitest：编解码金向量 + 重排 + 内存管道数据面 + 真实 libp2p TCP 双节点集成
 ```
 
-测试里 `test/client.test.ts` 起两个真实 js-libp2p 节点（TCP loopback + Noise + Yamux）跑完整握手/echo/路径增删/断连终态；`test/frame.test.ts` 与 `test/proto.test.ts` 的输入字节全部由 Go 端实际编码输出固化。
+测试里 `test/client.test.ts` 起两个真实 js-libp2p 节点（TCP loopback + Noise + Yamux）跑完整握手/echo/路径增删/断连终态；`test/frame.test.ts` 与 `test/proto.test.ts` 的输入字节全部由 Go 端实际编码输出固化。`test/tunnel-interop.test.ts` 会构建并启动 `js/e2e/tunnel-server`，验证 `tunnelFetch`/`tunnelWs` 与真实 Go tunnel server 的端到端互通。

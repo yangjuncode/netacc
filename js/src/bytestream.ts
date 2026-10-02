@@ -45,7 +45,8 @@ export class StreamReader {
 	private eof = false
 	private err: Error | undefined
 
-	constructor(private readonly bs: ByteStream) {}
+	// 只依赖 read()：隧道层用最小的「可读流」（如聚合流）即可驱动。
+	constructor(private readonly bs: Pick<ByteStream, 'read'>) {}
 
 	private get buffered(): number {
 		let n = 0
