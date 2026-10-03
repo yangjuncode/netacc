@@ -78,10 +78,11 @@ QUIC/WebTransport/WebRTC 同为 UDP，UDP 整类限速下同生共死——路�
 - 建立成功 = 至少一条数据路径 attached。
 - 控制消息（PATH_ADD/PATH_DROP/PATH_REQUEST/PATH_READY/遥测/心跳）为帧类型之一，**带内复用任意存活路径**，不绑定特定连接。
 - 可达地址不在握手内自带，依赖 identify/peerstore。
+- **鉴权（可选）**：`Hello.auth` 携带共享凭证，接收方按本地配置校验（校验器或固定 token，见 §8 API）；拒绝时回 `HelloAck{error}`（如 `unauthorized`）后关流。接收方未开鉴权时忽略 `auth` 字段；凭证跑在已加密的传输通道内，不防「泄漏后的重放」（凭证本身即权限）。
 
 ### 4.2 路径认证
 
-连接级认证 + ID 绑定：每条底层连接已完成 Noise/TLS 握手认证到 peerID（中继路径同样端到端加密，中继只见密文）；新路径流的 `PATH_ATTACH` 携带 `agg_stream_id` 即完成绑定，无逐路径签名。帧格式预留 MAC 字段位作未来加固扩展点。
+连接级认证 + ID 绑定：每条底层连接已完成 Noise/TLS 握手认证到 peerID（中继路径同样端到端加密，中继只见密文）；新路径流的 `PATH_ATTACH` 携带 `agg_stream_id` 即完成绑定，无逐路径签名；**绑定子流的对端必须是聚合流对端本人**（防第三方凭泄漏的 `agg_stream_id` 挂路径）。帧格式预留 MAC 字段位作未来加固扩展点。
 
 ### 4.3 路径管理
 

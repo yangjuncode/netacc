@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'vitest'
 import {
 	decodeHello,
+	decodeHelloAck,
 	decodePathAttach,
 	decodePathDrop,
 	decodePathReady,
@@ -13,6 +14,7 @@ import {
 	decodePing,
 	decodeTelemetry,
 	encodeHello,
+	encodeHelloAck,
 	encodePathAttach,
 	encodePathDrop,
 	encodePathReady,
@@ -37,6 +39,26 @@ describe('protobuf 金向量（Go proto.Marshal 生成）', () => {
 		expect(encodeHello(ID)).toEqual(want)
 		const m = decodeHello(want)
 		expect(m.aggStreamId).toEqual(ID)
+		expect(m.auth).toEqual(new Uint8Array(0))
+	})
+
+	it('Hello.auth：{bytes auth=2}；HelloAck.error：{string error=2}', () => {
+		// Hello{agg_stream_id=ID, auth="s3"}
+		const hello = hex('0a100102030405060708090a0b0c0d0e0f1012027333')
+		expect(encodeHello(ID, new Uint8Array([0x73, 0x33]))).toEqual(hello)
+		const m = decodeHello(hello)
+		expect(m.auth).toEqual(new Uint8Array([0x73, 0x33]))
+
+		// HelloAck{agg_stream_id=ID, error="unauthorized"}
+		const reason = 'unauthorized'
+		const enc = new TextEncoder().encode(reason)
+		const want = new Uint8Array([...hex('0a100102030405060708090a0b0c0d0e0f10'), 0x12, enc.length, ...enc])
+		expect(encodeHelloAck(ID, reason)).toEqual(want)
+		const ack = decodeHelloAck(want)
+		expect(ack.aggStreamId).toEqual(ID)
+		expect(ack.error).toBe(reason)
+		// 旧端只回显 id（无 error）→ error 为空串
+		expect(decodeHelloAck(encodeHelloAck(ID)).error).toBe('')
 	})
 
 	it('PathAttach：{bytes=1, uint64 path_id=2}', () => {

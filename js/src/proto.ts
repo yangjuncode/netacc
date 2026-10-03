@@ -135,22 +135,46 @@ function num(v: bigint): number {
 
 // ---------- 握手消息 ----------
 
-/** Hello / HelloAck：{ bytes agg_stream_id = 1 } */
-export function encodeHello(aggStreamId: Uint8Array): Uint8Array {
-	return new ProtoWriter().bytes(1, aggStreamId).buf
+/** Hello：{ bytes agg_stream_id = 1; bytes auth = 2 } */
+export function encodeHello(aggStreamId: Uint8Array, auth?: Uint8Array): Uint8Array {
+	return new ProtoWriter().bytes(1, aggStreamId).bytes(2, auth).buf
 }
 
-export function decodeHello(body: Uint8Array): { aggStreamId: Uint8Array } {
+export function decodeHello(body: Uint8Array): { aggStreamId: Uint8Array; auth: Uint8Array } {
 	const r = new ProtoReader(body)
 	let aggStreamId = new Uint8Array(0)
+	let auth = new Uint8Array(0)
 	for (let f = r.next(); f != null; f = r.next()) {
 		if (f.field === 1 && f.wire === WT_LEN) {
 			aggStreamId = r.bytes().slice()
+		} else if (f.field === 2 && f.wire === WT_LEN) {
+			auth = r.bytes().slice()
 		} else {
 			r.skip(f.wire)
 		}
 	}
-	return { aggStreamId }
+	return { aggStreamId, auth }
+}
+
+/** HelloAck：{ bytes agg_stream_id = 1; string error = 2 } */
+export function encodeHelloAck(aggStreamId: Uint8Array, error = ''): Uint8Array {
+	return new ProtoWriter().bytes(1, aggStreamId).str(2, error).buf
+}
+
+export function decodeHelloAck(body: Uint8Array): { aggStreamId: Uint8Array; error: string } {
+	const r = new ProtoReader(body)
+	let aggStreamId = new Uint8Array(0)
+	let error = ''
+	for (let f = r.next(); f != null; f = r.next()) {
+		if (f.field === 1 && f.wire === WT_LEN) {
+			aggStreamId = r.bytes().slice()
+		} else if (f.field === 2 && f.wire === WT_LEN) {
+			error = new TextDecoder().decode(r.bytes())
+		} else {
+			r.skip(f.wire)
+		}
+	}
+	return { aggStreamId, error }
 }
 
 // ---------- PATH_ATTACH / PATH_DROP ----------

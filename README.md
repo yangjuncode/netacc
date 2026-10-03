@@ -114,8 +114,36 @@ agg.Close()                                      // 已建立的流不受影响
 | `WithMinPaths(n)` | 两用 | 建流成功门槛：至少 n 条路径 attached（默认 1，不足返回 `ErrMinPaths`） |
 | `WithPolicy(p)` | `New` | 替换默认路径策略；`nil` 关闭自动化 |
 | `WithStreamPolicy(p)` | `OpenStream` | 该条流的策略覆盖；`nil` 关闭 |
+| `WithAuthToken(token)` | 两用 | 握手凭证：发起方写进 `Hello.auth`；接收方未配 handler 且非空时要求入向凭证与其相等（见下「鉴权」） |
+| `WithAuthHandler(h)` | `New` | 入向鉴权校验器 `func(peer.ID, []byte) error`；`nil` 时按 token 配置判定，两者皆无时放行 |
 
 「两用」= `SharedOption`：同一个 `WithXxx` 既可传 `New` 作构造默认，也可传 `OpenStream` 逐调用覆盖。
+
+#### 鉴权
+
+默认不鉴权（与旧版本一致：知道地址即可建流）。两种启用方式：
+
+```go
+// 简单共享 token：server 要求入向 Hello.auth 与 token 常数时间相等，
+// client 握手自动携带——两端配同一 token 即可。
+srv := netacc.New(h, netacc.WithAuthToken(token))
+cli := netacc.New(h, netacc.WithAuthToken(token)) // OpenStream 可逐调用覆盖
+
+// 自定义校验：按对端 peerID + 凭证判定（per-peer token、HMAC 等）。
+// 返回 nil 接受；error 文本经 HelloAck.error 回传对端（勿含敏感信息）。
+netacc.New(h, netacc.WithAuthHandler(func(p peer.ID, auth []byte) error {
+	if !check(p, auth) {
+		return errors.New("unauthorized")
+	}
+	return nil
+}))
+```
+
+- 要求鉴权时**未携带凭证同样被拒**（空 auth 照常交给 handler 判）。
+- 拒绝时 client 收到 `ErrHandshake` 包装的原因（`对端拒绝: unauthorized`）。
+- 拒绝原因最多 256 字节，按 UTF-8 字符边界截断；handler 返回空文本 error 时回传 `unauthorized`。
+- token 跑在 libp2p 加密通道内、不可伪造 peerID，但它是 bearer 凭证——泄漏即权限，建议 ≥16 字节随机值并支持轮换。
+- 只守聚合协议层；同 host 跑的中继等其他服务须另行防护（`relay.WithWhitelist` peerID 白名单，不配 ACL 时 `relay.New` 报 `ErrNoACL`）。
 
 ### Stream — net.Conn + 路径管理 + 观测
 
@@ -274,6 +302,13 @@ netacc client -server /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW... -listen-port 8080
 netacc server -listen /ip4/0.0.0.0/tcp/4001 \
   -tunnel-http-echo -tunnel-ws-echo \
   -tunnel-allow https://api.example.com -tunnel-allow wss://events.example.com
+
+# 鉴权：两端配同一 -token（或 NETACC_TOKEN 环境变量）；
+# -identity 固定 Ed25519 私钥文件使 PeerID 稳定（供中继白名单等登记）。
+NETACC_TOKEN=$(openssl rand -hex 32) netacc server -listen /ip4/0.0.0.0/tcp/4001 \
+  -identity ~/.netacc/server.key -upstream 127.0.0.1:80
+NETACC_TOKEN=... netacc client -server /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW... \
+  -identity ~/.netacc/client.key -listen-port 8080
 ```
 
 ## HTTP/WebSocket 隧道（Go + TypeScript）

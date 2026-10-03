@@ -6,7 +6,9 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"unicode/utf8"
 
 	msgio "github.com/libp2p/go-msgio"
 	"google.golang.org/protobuf/proto"
@@ -22,9 +24,11 @@ const aggStreamIDLen = 16
 const maxHandshakeMsg = 4 << 10
 
 // handshakeInitiator 在握手流上执行发起方握手：
-// 生成 128bit 随机 agg_stream_id，发 Hello，收 HelloAck 并校验回显一致。
-// 握手完成后该流即升格为聚合流的第一条数据路径（规格书 §4.1 分离+复用混合）。
-func handshakeInitiator(s msgReadWriter) ([16]byte, error) {
+// 生成 128bit 随机 agg_stream_id，发 Hello（携带可选鉴权凭证 auth），
+// 收 HelloAck 并校验回显一致。对端经 HelloAck.error 拒绝时返回
+// 对应原因。握手完成后该流即升格为聚合流的第一条数据路径
+// （规格书 §4.1 分离+复用混合）。
+func handshakeInitiator(s msgReadWriter, auth []byte) ([16]byte, error) {
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return id, fmt.Errorf("生成 agg_stream_id 失败: %w", err)
@@ -32,7 +36,7 @@ func handshakeInitiator(s msgReadWriter) ([16]byte, error) {
 	w := msgio.NewVarintWriter(s)
 	r := msgio.NewVarintReaderSize(s, maxHandshakeMsg)
 
-	raw, err := proto.Marshal(&pb.Hello{AggStreamId: id[:]})
+	raw, err := proto.Marshal(&pb.Hello{AggStreamId: id[:], Auth: auth})
 	if err != nil {
 		return id, fmt.Errorf("编码 Hello 失败: %w", err)
 	}
@@ -46,6 +50,9 @@ func handshakeInitiator(s msgReadWriter) ([16]byte, error) {
 	var ack pb.HelloAck
 	if err := proto.Unmarshal(raw, &ack); err != nil {
 		return id, fmt.Errorf("解码 HelloAck 失败: %w", err)
+	}
+	if e := ack.GetError(); e != "" {
+		return id, fmt.Errorf("对端拒绝: %s", e)
 	}
 	if !bytes.Equal(ack.GetAggStreamId(), id[:]) {
 		return id, errors.New("HelloAck 回显的 agg_stream_id 与本地生成不一致")
@@ -68,31 +75,61 @@ type msgReadWriter interface {
 // 对端的首挂路径会因路由表查无此 agg_stream_id 而被 reset。
 
 // handshakeResponderRead 是接收方握手前半：收 Hello
-// （校验 agg_stream_id 恰为 16 字节），返回协商出的聚合流标识。
-func handshakeResponderRead(s msgReadWriter) ([16]byte, error) {
+// （校验 agg_stream_id 恰为 16 字节），返回协商出的聚合流标识
+// 与对端携带的鉴权凭证（未携带时为空切片）。
+func handshakeResponderRead(s msgReadWriter) ([16]byte, []byte, error) {
 	var id [16]byte
 	r := msgio.NewVarintReaderSize(s, maxHandshakeMsg)
 	raw, err := r.ReadMsg()
 	if err != nil {
-		return id, fmt.Errorf("等待 Hello 失败: %w", err)
+		return id, nil, fmt.Errorf("等待 Hello 失败: %w", err)
 	}
 	var hello pb.Hello
 	if err := proto.Unmarshal(raw, &hello); err != nil {
-		return id, fmt.Errorf("解码 Hello 失败: %w", err)
+		return id, nil, fmt.Errorf("解码 Hello 失败: %w", err)
 	}
 	if len(hello.GetAggStreamId()) != aggStreamIDLen {
-		return id, fmt.Errorf("agg_stream_id 应为 %d 字节，实收 %d",
+		return id, nil, fmt.Errorf("agg_stream_id 应为 %d 字节，实收 %d",
 			aggStreamIDLen, len(hello.GetAggStreamId()))
 	}
 	copy(id[:], hello.GetAggStreamId())
-	return id, nil
+	return id, hello.GetAuth(), nil
 }
 
 // handshakeResponderAck 是接收方握手后半：回写 HelloAck 表示接受。
 // 应答发出后，握手流升格为该聚合流的第一条数据路径（分离+复用混合，
 // 规格书 §4.1）。
 func handshakeResponderAck(s msgReadWriter, id [16]byte) error {
-	raw, err := proto.Marshal(&pb.HelloAck{AggStreamId: id[:]})
+	return writeHelloAck(s, id, "")
+}
+
+// maxRejectReasonLen 是回传对端的拒绝原因长度上限：裁到该长度内
+// 保证落在 maxHandshakeMsg 之内，对端总能收到可诊断的 error
+// （过长的原因对端读不出，退化为普通握手失败）。
+const maxRejectReasonLen = 256
+
+// handshakeResponderReject 回写携带 error 的 HelloAck 表示拒绝：
+// agg_stream_id 照常回显便于对端关联，initiator 优先判 error 字段。
+// 发出后由调用方负责关闭握手流（优雅关闭保证应答送达）。
+func handshakeResponderReject(s msgReadWriter, id [16]byte, reason string) error {
+	// error 文本可能为空或包含非法 UTF-8；拒绝必须始终编码成非空 string。
+	reason = strings.ToValidUTF8(reason, "\uFFFD")
+	if reason == "" {
+		reason = errAuthRejected.Error()
+	}
+	if len(reason) > maxRejectReasonLen {
+		end := maxRejectReasonLen
+		for !utf8.RuneStart(reason[end]) {
+			end--
+		}
+		reason = reason[:end]
+	}
+	return writeHelloAck(s, id, reason)
+}
+
+// writeHelloAck 编码并写出一条 HelloAck；reason 非空即拒绝语义。
+func writeHelloAck(s msgReadWriter, id [16]byte, reason string) error {
+	raw, err := proto.Marshal(&pb.HelloAck{AggStreamId: id[:], Error: reason})
 	if err != nil {
 		return fmt.Errorf("编码 HelloAck 失败: %w", err)
 	}

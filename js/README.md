@@ -58,6 +58,29 @@ await st.close()
 const incoming = await client.accept()
 ```
 
+## 鉴权（与 Go 端 WithAuthToken/WithAuthHandler 对应）
+
+默认不鉴权。`authToken` 做共享 token：发起方握手 `Hello.auth` 自动携带；
+入向未配 `authHandler` 且 `authToken` 非空时要求对端凭证相等
+（与 Go 端 `WithAuthToken` 的双侧语义一致）。
+
+```ts
+const token = new TextEncoder().encode('s3cr3t…') // 建议 ≥16 字节随机值
+const client = new NetaccClient(node, { authToken: token })
+// 逐调用覆盖：client.openStream(server, { authToken: token })
+
+// 入向自定义校验：true 接受；false 或 string（回传对端的拒绝原因）拒绝。
+const server = new NetaccClient(node, {
+  authHandler: (remotePeer, auth) =>
+    new TextDecoder().decode(auth) === 'let-me-in' ? true : 'unauthorized',
+})
+```
+
+被拒方收到 `handshake` 码错误（`对端拒绝: <reason>`）。
+拒绝原因最多 256 字节，按 UTF-8 字符边界截断；空原因改为 `unauthorized`。
+`authHandler` 可返回 Promise，等待受握手超时和 `accept` 的 `signal` 约束；
+超时或取消后忽略迟到结果，后续握手仍可继续处理。
+
 ## HTTP/WebSocket 隧道
 
 `NetaccClient` 内置 `tunnelwire` 应用层协议（见仓库 `docs/spec/tunnel-http-ws.md`），可把网页中的 HTTP/WS 请求经聚合流送到 Go `tunnel.Server`：

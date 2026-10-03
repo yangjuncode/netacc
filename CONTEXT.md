@@ -41,6 +41,10 @@ _Avoid_: HTTP 多路复用、隧道子流
 `tunnelFetch`/`tunnelWs` 请求的应用层目标：`/path` 表示 server 本地 handler，`http(s)://`/`ws(s)://` 绝对 URL 表示 server 代理目标。
 _Avoid_: upstream、上游地址
 
+**握手凭证 (Hello.auth)**:
+握手 Hello 携带的可选鉴权字段；接收方经 `WithAuthHandler`（自定义校验器）或 `WithAuthToken`（固定 token 常数时间比较）判定，未配则忽略。拒绝原因经 `HelloAck.error` 回传。
+_Avoid_: 密码、session token
+
 ### 内部机制
 
 **调度器 (Scheduler)**:

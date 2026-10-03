@@ -11,10 +11,15 @@
 // 带 "NTUN\x01" 的 HTTP/WS 隧道流按 target 分流到 echo handler 或
 // -tunnel-allow 允许的上游代理。client 端把 0.0.0.0:<listen-port> 上的每条
 // TCP 连接经一条聚合流桥接到 server peer。
+//
+// 鉴权：两端配同一个 -token（或 NETACC_TOKEN 环境变量）即启用共享 token
+// 鉴权——server 要求入向握手携带匹配 token，client 握手时自动携带；
+// server 不配则一切入向握手放行（默认）。
 package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,11 +29,13 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/yangjuncode/netacc"
@@ -64,19 +71,106 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `用法:
   netacc server -listen <multiaddr> [-upstream <host:port>]
     [-tunnel-http-echo] [-tunnel-ws-echo] [-tunnel-allow <URL或host:port>...]
+    [-token <共享 token>] [-identity <私钥文件>]
   netacc client -server <multiaddr带/p2p/> -listen-port <端口>
+    [-token <共享 token>] [-identity <私钥文件>]
 
 示例:
   netacc server -listen /ip4/0.0.0.0/tcp/4001 -upstream 127.0.0.1:80
   netacc server -listen /ip4/0.0.0.0/tcp/4001 -tunnel-http-echo -tunnel-ws-echo \
     -tunnel-allow https://api.example.com -tunnel-allow wss://events.example.com
   netacc client -server /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW... -listen-port 8080
+
+鉴权:
+  两端配同一个 -token（或 NETACC_TOKEN 环境变量）即启用共享 token 鉴权；
+  server 不配 -token 时一切入向握手放行。token 建议 ≥16 字节随机值。
+  -identity 指定 Ed25519 私钥文件（不存在则生成），提供稳定 PeerID，
+  供对端登记白名单（如中继 ACL）或固定 server 的 /p2p/ 地址。
 `)
 }
 
 // notifyCtx 把 SIGINT/SIGTERM 变成 ctx 取消；Run 视取消为正常退出。
 func notifyCtx() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
+
+// authToken 取鉴权 token：-token flag 优先，缺省回退 NETACC_TOKEN
+// 环境变量（避免明文出现在 ps/命令行历史）；都为空返回 nil（不鉴权）。
+func authToken(flagVal string) []byte {
+	if flagVal == "" {
+		flagVal = os.Getenv("NETACC_TOKEN")
+	}
+	return []byte(flagVal)
+}
+
+// readIdentity 读取已有私钥，保留底层错误以便识别文件不存在。
+func readIdentity(path string) (crypto.PrivKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取私钥文件 %s 失败: %w", path, err)
+	}
+	priv, err := crypto.UnmarshalPrivateKey(data)
+	if err != nil {
+		return nil, fmt.Errorf("解析私钥文件 %s 失败: %w", path, err)
+	}
+	return priv, nil
+}
+
+// loadOrCreateIdentity 读取 Ed25519 私钥文件；文件不存在时生成
+// 新密钥并以 0600 权限原子发布，确保并发首启及重启使用同一身份。
+func loadOrCreateIdentity(path string) (crypto.PrivKey, error) {
+	priv, err := readIdentity(path)
+	if err == nil {
+		return priv, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	priv, _, err = crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("生成身份私钥失败: %w", err)
+	}
+	raw, err := crypto.MarshalPrivateKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("编码私钥失败: %w", err)
+	}
+	// 同目录临时文件先完整写入，再用硬链接排他发布；目标路径从不暴露半写文件。
+	f, err := os.CreateTemp(filepath.Dir(path), ".netacc-identity-*")
+	if err != nil {
+		return nil, fmt.Errorf("创建私钥临时文件失败: %w", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if _, err := f.Write(raw); err != nil {
+		return nil, fmt.Errorf("写入私钥文件 %s 失败: %w", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		return nil, fmt.Errorf("同步私钥文件 %s 失败: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("关闭私钥文件 %s 失败: %w", path, err)
+	}
+	if err := os.Link(f.Name(), path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			// 其他进程已发布完整密钥，使用获胜者的身份，不能覆盖它。
+			return readIdentity(path)
+		}
+		return nil, fmt.Errorf("写入私钥文件 %s 失败: %w", path, err)
+	}
+	return priv, nil
+}
+
+// libp2pIdentity 按 -identity flag 组 host 身份选项；
+// 空路径返回 nil（临时身份，每次启动随机 PeerID）。
+func libp2pIdentity(path string) (libp2p.Option, error) {
+	if path == "" {
+		return nil, nil
+	}
+	priv, err := loadOrCreateIdentity(path)
+	if err != nil {
+		return nil, err
+	}
+	return libp2p.Identity(priv), nil
 }
 
 // stringList 收集可重复 flag。
@@ -189,6 +283,8 @@ func runServer(args []string) error {
 	fs := flag.NewFlagSet("server", flag.ContinueOnError)
 	listen := fs.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p 监听 multiaddr")
 	upstream := fs.String("upstream", "", "上游 TCP 服务地址 host:port（可选）")
+	token := fs.String("token", "", "鉴权 token（亦可用 NETACC_TOKEN）；不配 = 入向握手不校验")
+	identity := fs.String("identity", "", "Ed25519 私钥文件（不存在则生成），提供稳定 PeerID")
 	httpEchoFlag := fs.Bool("tunnel-http-echo", false, "启用相对路径的 HTTP echo handler")
 	wsEchoFlag := fs.Bool("tunnel-ws-echo", false, "启用相对路径的 WS echo handler")
 	var allow stringList
@@ -228,13 +324,25 @@ func runServer(args []string) error {
 		return errors.New("缺少服务配置：请指定 -upstream、-tunnel-http-echo、-tunnel-ws-echo 或 -tunnel-allow")
 	}
 
-	h, err := libp2p.New(libp2p.ListenAddrStrings(*listen))
+	ident, err := libp2pIdentity(*identity)
+	if err != nil {
+		return err
+	}
+	lpOpts := []libp2p.Option{libp2p.ListenAddrStrings(*listen)}
+	if ident != nil {
+		lpOpts = append(lpOpts, ident)
+	}
+	h, err := libp2p.New(lpOpts...)
 	if err != nil {
 		return fmt.Errorf("创建 host 失败: %w", err)
 	}
 	defer h.Close()
 
-	agg := netacc.New(h)
+	var aggOpts []netacc.Option
+	if tok := authToken(*token); len(tok) > 0 {
+		aggOpts = append(aggOpts, netacc.WithAuthToken(tok))
+	}
+	agg := netacc.New(h, aggOpts...)
 	defer agg.Close()
 
 	srv, err := tunnel.NewServer(agg, opts...)
@@ -258,6 +366,11 @@ func runServer(args []string) error {
 	if len(allow) > 0 {
 		fmt.Printf("HTTP/WS 代理 allowlist: %s\n", strings.Join(allow, ", "))
 	}
+	if len(authToken(*token)) > 0 {
+		fmt.Println("鉴权: 已启用（入向握手须携带匹配 token）")
+	} else {
+		fmt.Println("鉴权: 未启用（一切入向握手放行）")
+	}
 
 	ctx, stop := notifyCtx()
 	defer stop()
@@ -269,6 +382,8 @@ func runClient(args []string) error {
 	fs := flag.NewFlagSet("client", flag.ContinueOnError)
 	server := fs.String("server", "", "server 的 multiaddr，须以 /p2p/<peerID> 结尾（必填）")
 	listenPort := fs.Int("listen-port", -1, "TCP 监听端口（必填；固定监听 0.0.0.0）")
+	token := fs.String("token", "", "鉴权 token（亦可用 NETACC_TOKEN）；须与 server 端一致")
+	identity := fs.String("identity", "", "Ed25519 私钥文件（不存在则生成），提供稳定 PeerID")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil // -h：flag 包已打印用法，不算运行错误
@@ -292,13 +407,25 @@ func runClient(args []string) error {
 	// client 只主动拨 server，不需要自身监听地址（NAT 友好）；
 	// 对端的入向 PATH_ATTACH 拨不进来时仅自动补路径功能受限，
 	// 本侧发起的补路径不受影响。
-	h, err := libp2p.New(libp2p.NoListenAddrs)
+	ident, err := libp2pIdentity(*identity)
+	if err != nil {
+		return err
+	}
+	lpOpts := []libp2p.Option{libp2p.NoListenAddrs}
+	if ident != nil {
+		lpOpts = append(lpOpts, ident)
+	}
+	h, err := libp2p.New(lpOpts...)
 	if err != nil {
 		return fmt.Errorf("创建 host 失败: %w", err)
 	}
 	defer h.Close()
 
-	agg := netacc.New(h)
+	var aggOpts []netacc.Option
+	if tok := authToken(*token); len(tok) > 0 {
+		aggOpts = append(aggOpts, netacc.WithAuthToken(tok))
+	}
+	agg := netacc.New(h, aggOpts...)
 	defer agg.Close()
 
 	ctx, stop := notifyCtx()
@@ -313,6 +440,7 @@ func runClient(args []string) error {
 		return err
 	}
 
+	fmt.Printf("PeerID: %s\n", h.ID())
 	fmt.Printf("已连接 server: %s\n", info.ID)
 
 	// 后台跑 Run，等 listener 就位后打印实际监听地址

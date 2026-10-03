@@ -27,7 +27,11 @@ type Hello struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// agg_stream_id：发起方生成的 128bit 随机聚合流标识。
 	// 后续所有数据路径的 PATH_ATTACH 凭此 ID 绑定到同一条聚合流。
-	AggStreamId   []byte `protobuf:"bytes,1,opt,name=agg_stream_id,json=aggStreamId,proto3" json:"agg_stream_id,omitempty"`
+	AggStreamId []byte `protobuf:"bytes,1,opt,name=agg_stream_id,json=aggStreamId,proto3" json:"agg_stream_id,omitempty"`
+	// auth：可选鉴权凭证（与接收方约定的共享密钥）。
+	// 接收方配置了鉴权（WithAuthHandler/WithAuthToken）时按配置校验；
+	// 未开鉴权时忽略本字段。
+	Auth          []byte `protobuf:"bytes,2,opt,name=auth,proto3" json:"auth,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -69,12 +73,22 @@ func (x *Hello) GetAggStreamId() []byte {
 	return nil
 }
 
+func (x *Hello) GetAuth() []byte {
+	if x != nil {
+		return x.Auth
+	}
+	return nil
+}
+
 // HelloAck 是接收方对 Hello 的应答：回显 agg_stream_id 即表示接受。
 // 应答发出后，握手流升格为该聚合流的第一条数据路径（分离+复用混合，
 // 规格书 §4.1）。
 type HelloAck struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AggStreamId   []byte                 `protobuf:"bytes,1,opt,name=agg_stream_id,json=aggStreamId,proto3" json:"agg_stream_id,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	AggStreamId []byte                 `protobuf:"bytes,1,opt,name=agg_stream_id,json=aggStreamId,proto3" json:"agg_stream_id,omitempty"`
+	// error：非空表示接收方拒绝（如鉴权失败 "unauthorized"），
+	// 此时 agg_stream_id 不代表协商成功。
+	Error         string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -114,6 +128,13 @@ func (x *HelloAck) GetAggStreamId() []byte {
 		return x.AggStreamId
 	}
 	return nil
+}
+
+func (x *HelloAck) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
 }
 
 // PathAttach 是 PATH_ATTACH 帧（帧类型 3）的 protobuf 帧体。
@@ -537,11 +558,13 @@ var File_internal_pb_agg_proto protoreflect.FileDescriptor
 
 const file_internal_pb_agg_proto_rawDesc = "" +
 	"\n" +
-	"\x15internal/pb/agg.proto\x12\tnetacc.v1\"+\n" +
+	"\x15internal/pb/agg.proto\x12\tnetacc.v1\"?\n" +
 	"\x05Hello\x12\"\n" +
-	"\ragg_stream_id\x18\x01 \x01(\fR\vaggStreamId\".\n" +
+	"\ragg_stream_id\x18\x01 \x01(\fR\vaggStreamId\x12\x12\n" +
+	"\x04auth\x18\x02 \x01(\fR\x04auth\"D\n" +
 	"\bHelloAck\x12\"\n" +
-	"\ragg_stream_id\x18\x01 \x01(\fR\vaggStreamId\"I\n" +
+	"\ragg_stream_id\x18\x01 \x01(\fR\vaggStreamId\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"I\n" +
 	"\n" +
 	"PathAttach\x12\"\n" +
 	"\ragg_stream_id\x18\x01 \x01(\fR\vaggStreamId\x12\x17\n" +

@@ -22,6 +22,7 @@ import {
 	handshakeInitiator,
 	handshakeResponderAck,
 	handshakeResponderRead,
+	handshakeResponderReject,
 } from './handshake.js'
 import {
 	AggregatedStream,
@@ -82,6 +83,24 @@ export interface NetaccClientOptions {
 	 * 未设置时这两个方法抛错，请改用 tunnelFetchTo/tunnelWsTo 显式指定。
 	 */
 	tunnelTarget?: StreamTarget
+	/**
+	 * 握手凭证：openStream 写进 Hello.auth 发给对端（与 server 约定
+	 * 的共享密钥，建议 ≥16 字节随机值）；可经 OpenStreamOptions.authToken
+	 * 逐调用覆盖。入向便利语义：未配 authHandler 且非空时，入向握手
+	 * 要求 Hello.auth 与本 token 相等，否则回 "unauthorized" 拒绝——
+	 * 与 Go 端 WithAuthToken 语义一致。
+	 */
+	authToken?: Uint8Array
+	/**
+	 * 入向握手鉴权校验器：未配时按 authToken 判定，两者皆无时放行；配了则每条入向
+	 * Hello 都须通过它（未携带凭证同样交给它判）。返回 true 接受；
+	 * false 或 string 拒绝——string 作为拒绝原因经 HelloAck.error
+	 * 回传对端（内容会发给不可信对端，勿含敏感信息；最多 256 字节，
+	 * 按 UTF-8 字符边界截断；空原因改为 unauthorized）。
+	 * 可返回 Promise，等待受握手超时和 accept 的 signal 约束。
+	 * remotePeer 为传输层已认证的对端 PeerId。
+	 */
+	authHandler?: (remotePeer: PeerId, auth: Uint8Array) => boolean | string | Promise<boolean | string>
 }
 
 /** OpenStreamOptions 是单次 openStream 的生效配置（逐调用覆盖构造默认）。 */
@@ -98,6 +117,8 @@ export interface OpenStreamOptions {
 	/** 该条流的最小路径数门槛。 */
 	minPaths?: number
 	telemetryIntervalMs?: number
+	/** 握手凭证（覆盖构造默认 authToken）。 */
+	authToken?: Uint8Array
 }
 
 interface InboundHandshake {
@@ -207,7 +228,7 @@ export class NetaccClient {
 		signal?.addEventListener('abort', onAbort, { once: true })
 		try {
 			const reader = new StreamReader(bs)
-			const id = await handshakeInitiator(bs, reader)
+			const id = await handshakeInitiator(bs, reader, options?.authToken ?? this.opts.authToken)
 			const st = new AggregatedStream(this.streamOpts({
 				id,
 				firstPath: bs,
@@ -333,7 +354,17 @@ export class NetaccClient {
 			signal?.addEventListener('abort', onAbort, { once: true })
 			try {
 				const reader = new StreamReader(bs)
-				const id = await handshakeResponderRead(reader)
+				const { id, auth } = await handshakeResponderRead(reader)
+				// 鉴权：配了 handler 或未关 token 校验时每条入向
+				// Hello 都须判定（未带凭证同样照判）
+				const reason = await waitForSignal(this.checkAuth(item.conn.remotePeer, auth), signal)
+				if (reason !== null) {
+					// 回 HelloAck{error} 让对端拿到原因；close 是优雅
+					// 关闭（先把应答发出去），不用 abort
+					await handshakeResponderReject(bs, id, reason)
+					await bs.close()
+					continue
+				}
 				const st = new AggregatedStream(this.streamOpts({
 					id,
 					firstPath: bs,
@@ -505,8 +536,10 @@ export class NetaccClient {
 				return
 			}
 			const st = this.streams.get(idKey(aggStreamId))
-			if (st === undefined) {
-				fail() // 不认识的 agg_stream_id
+			if (st === undefined || st.peer === undefined || !conn.remotePeer.equals(st.peer)) {
+				// 不认识的 agg_stream_id，或绑定子流并非来自该聚合流
+				// 的对端（防第三方凭泄漏的 id 挂路径，与 Go 端对齐）
+				fail()
 				return
 			}
 			// 预定 path_id：分侧命名空间 + 不重复（死路径重加须换新 id）
@@ -523,6 +556,28 @@ export class NetaccClient {
 		} finally {
 			clearTimeout(timer)
 		}
+	}
+
+	/**
+	 * checkAuth 是入向握手的鉴权判定（对应 Go 端 Aggregator.checkAuth）：
+	 * 配了 authHandler 全权交给它；未配但 authToken 非空时退化为
+	 * 「auth 与 token 常数时间相等」；两者皆无 → 放行。
+	 * 返回 null 表示接受，否则为回传对端的拒绝原因。
+	 */
+	private async checkAuth(remotePeer: PeerId, auth: Uint8Array): Promise<string | null> {
+		const h = this.opts.authHandler
+		if (h !== undefined) {
+			const v = await h(remotePeer, auth)
+			if (v === true) {
+				return null
+			}
+			return typeof v === 'string' && v !== '' ? v : 'unauthorized'
+		}
+		const tok = this.opts.authToken
+		if (tok !== undefined && tok.length > 0 && !constEqual(auth, tok)) {
+			return 'unauthorized'
+		}
+		return null
 	}
 
 	/** register/unregister 维护 PATH_ATTACH 路由表。 */
@@ -577,6 +632,18 @@ export class NetaccClient {
 	}
 }
 
+/** constEqual 不提前退出的字节串比较（与 Go subtle.ConstantTimeCompare 对齐）。 */
+function constEqual(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.length !== b.length) {
+		return false
+	}
+	let diff = 0
+	for (let i = 0; i < a.length; i++) {
+		diff |= a[i] ^ b[i]
+	}
+	return diff === 0
+}
+
 function toErr(e: unknown): Error {
 	return e instanceof Error ? e : new Error(String(e))
 }
@@ -602,6 +669,29 @@ function combineSignal(user: AbortSignal | undefined, timeoutMs: number | undefi
 		return undefined
 	}
 	return sigs.length === 1 ? sigs[0] : AbortSignal.any(sigs)
+}
+
+/** waitForSignal 让异步鉴权响应超时/取消；返回后移除监听器，迟到结果不再推进握手。 */
+async function waitForSignal<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (signal === undefined) {
+		return pending
+	}
+	let onAbort = () => {}
+	try {
+		return await new Promise<T>((resolve, reject) => {
+			onAbort = () => reject(signal.reason instanceof Error
+				? signal.reason
+				: netaccErr('timeout', 'netacc: 操作被取消'))
+			signal.addEventListener('abort', onAbort, { once: true })
+			// 即使已取消也消费迟到的 rejection，避免未处理的 Promise 错误。
+			pending.then(resolve, reject)
+			if (signal.aborted) {
+				onAbort()
+			}
+		})
+	} finally {
+		signal.removeEventListener('abort', onAbort)
+	}
 }
 
 /** abortableNever 返回一个在 signal abort 时 reject 的 promise（永不 resolve）。 */

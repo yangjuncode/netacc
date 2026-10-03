@@ -8,7 +8,7 @@
 
 import type { ByteStream, StreamReader } from './bytestream.js'
 import { appendUvarint } from './varint.js'
-import { encodeHello, decodeHello } from './proto.js'
+import { decodeHello, decodeHelloAck, encodeHello, encodeHelloAck } from './proto.js'
 import { netaccErr } from './types.js'
 
 /** agg_stream_id 的字节长度（128bit，规格书 §4.1）。 */
@@ -40,18 +40,22 @@ export async function readMsg(r: StreamReader, max = MAX_HANDSHAKE_MSG): Promise
 
 /**
  * handshakeInitiator 在握手流上执行发起方握手：
- * 生成 128bit 随机 agg_stream_id，发 Hello，收 HelloAck 并校验回显一致。
+ * 生成 128bit 随机 agg_stream_id，发 Hello（携带可选鉴权凭证 auth），
+ * 收 HelloAck 并校验回显一致；对端经 HelloAck.error 拒绝时抛对应原因。
  * 握手完成后该流即升格为聚合流的第一条数据路径（规格书 §4.1）。
  */
-export async function handshakeInitiator(bs: ByteStream, r: StreamReader): Promise<Uint8Array> {
+export async function handshakeInitiator(bs: ByteStream, r: StreamReader, auth?: Uint8Array): Promise<Uint8Array> {
 	const id = new Uint8Array(AGG_STREAM_ID_LEN)
 	globalThis.crypto.getRandomValues(id)
-	await writeMsg(bs, encodeHello(id))
+	await writeMsg(bs, encodeHello(id, auth))
 	const raw = await readMsg(r)
 	if (raw === null) {
 		throw netaccErr('handshake', 'netacc: 等待 HelloAck 失败: EOF')
 	}
-	const ack = decodeHello(raw) // HelloAck 与 Hello 线格式同构（bytes agg_stream_id=1）
+	const ack = decodeHelloAck(raw)
+	if (ack.error !== '') {
+		throw netaccErr('handshake', `netacc: 对端拒绝: ${ack.error}`)
+	}
 	if (!bytesEqual(ack.aggStreamId, id)) {
 		throw netaccErr('handshake', 'netacc: HelloAck 回显的 agg_stream_id 与本地生成不一致')
 	}
@@ -60,9 +64,10 @@ export async function handshakeInitiator(bs: ByteStream, r: StreamReader): Promi
 
 /**
  * handshakeResponderRead 是接收方握手前半：收 Hello
- * （校验 agg_stream_id 恰为 16 字节），返回协商出的聚合流标识。
+ * （校验 agg_stream_id 恰为 16 字节），返回协商出的聚合流标识
+ * 与对端携带的鉴权凭证（未携带时为空）。
  */
-export async function handshakeResponderRead(r: StreamReader): Promise<Uint8Array> {
+export async function handshakeResponderRead(r: StreamReader): Promise<{ id: Uint8Array; auth: Uint8Array }> {
 	const raw = await readMsg(r)
 	if (raw === null) {
 		throw netaccErr('handshake', 'netacc: 等待 Hello 失败: EOF')
@@ -71,7 +76,7 @@ export async function handshakeResponderRead(r: StreamReader): Promise<Uint8Arra
 	if (hello.aggStreamId.length !== AGG_STREAM_ID_LEN) {
 		throw netaccErr('handshake', `netacc: agg_stream_id 应为 ${AGG_STREAM_ID_LEN} 字节，实收 ${hello.aggStreamId.length}`)
 	}
-	return hello.aggStreamId.slice()
+	return { id: hello.aggStreamId.slice(), auth: hello.auth.slice() }
 }
 
 /**
@@ -79,7 +84,22 @@ export async function handshakeResponderRead(r: StreamReader): Promise<Uint8Arra
  * 应答发出后，握手流升格为该聚合流的第一条数据路径。
  */
 export async function handshakeResponderAck(bs: ByteStream, id: Uint8Array): Promise<void> {
-	await writeMsg(bs, encodeHello(id)) // HelloAck{agg_stream_id=1} 编码相同
+	await writeMsg(bs, encodeHelloAck(id))
+}
+
+/**
+ * handshakeResponderReject 回写携带 error 的 HelloAck 表示拒绝：
+ * agg_stream_id 照常回显便于对端关联，initiator 优先判 error 字段。
+ * 发出后由调用方负责关闭握手流（优雅关闭保证应答送达）。
+ */
+export async function handshakeResponderReject(bs: ByteStream, id: Uint8Array, reason: string): Promise<void> {
+	// 与 Go 对齐：最多 256 字节，保留完整 UTF-8 字符；空原因同样表示拒绝。
+	const raw = new TextEncoder().encode(reason || 'unauthorized')
+	let end = Math.min(raw.length, 256)
+	while (end < raw.length && (raw[end]! & 0xc0) === 0x80) {
+		end--
+	}
+	await writeMsg(bs, encodeHelloAck(id, new TextDecoder().decode(raw.subarray(0, end))))
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {

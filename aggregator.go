@@ -13,6 +13,7 @@ package netacc
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"sync"
@@ -138,6 +139,13 @@ type options struct {
 	// policy：聚合流默认路径策略（#24，规格书 §8 可插拔钩子）。
 	// nil = 关闭自动化；默认见 New（DefaultPolicy()）。
 	policy Policy
+	// authToken：握手凭证（Hello.auth）。发起方语义——写进
+	// 握手 Hello 发给对端；接收方便利语义——未配 authHandler
+	// 且非空时，要求入向 Hello.auth 与其常数时间相等。
+	authToken []byte
+	// authHandler：入向握手鉴权校验器（WithAuthHandler）。
+	// nil = 不鉴权（默认，一切入向握手放行）。
+	authHandler AuthHandler
 }
 
 // openOptions 是单次 OpenStream 的生效配置：先从 Aggregator 默认
@@ -150,6 +158,8 @@ type openOptions struct {
 	// policy：该条流的策略覆盖（WithStreamPolicy）；未给时沿用
 	// Aggregator 默认（defaultOpenOptions 先填 a.opts.policy）。
 	policy Policy
+	// authToken：该条流的握手凭证覆盖（WithAuthToken）。
+	authToken []byte
 }
 
 // WithAcceptBacklog 设置等待 Accept 的入向握手流排队长度（默认 16）。
@@ -200,6 +210,38 @@ func WithMinPaths(n int) SharedOption {
 		opt:  func(o *options) { o.minPaths = n },
 		open: func(o *openOptions) { o.minPaths = n },
 	}
+}
+
+// WithAuthToken 设置握手凭证（Hello.auth，与对端约定的共享密钥，
+// 建议 ≥16 字节随机值）。两侧语义：
+//   - 发起方：OpenStream 把 token 写进握手 Hello 发给对端；
+//   - 接收方：未配 WithAuthHandler 且 token 非空时，要求入向
+//     Hello.auth 与本 token 常数时间相等——不匹配（含未携带）回
+//     "unauthorized" 拒绝。server/client 两端配同一 token 即得
+//     最简单的共享 token 鉴权；配了 WithAuthHandler 时接收方判定
+//     完全交给 handler，本字段不参与。
+//
+// 构造默认与 OpenStream 逐调用覆盖两用。
+func WithAuthToken(token []byte) SharedOption {
+	return optionSet{
+		opt:  func(o *options) { o.authToken = token },
+		open: func(o *openOptions) { o.authToken = token },
+	}
+}
+
+// AuthHandler 是入向握手的凭证校验器：p 为传输层已认证的对端
+// peerID（libp2p 安全通道保证不可伪造），auth 为 Hello 携带的
+// 凭证（可为空——要求鉴权时空凭证同样交给 handler 判，由返回值
+// 决定去留）。返回 nil 接受；非 nil 时拒绝握手，error 文本经
+// HelloAck.error 回传对端（内容会发给不可信对端，勿含敏感信息；
+// 空文本改为 unauthorized；超过 256 字节按 UTF-8 字符边界截断）。
+type AuthHandler func(p peer.ID, auth []byte) error
+
+// WithAuthHandler 配置入向握手的鉴权校验器（仅 New 构造默认）。
+// 不配或传 nil 时按 WithAuthToken 判定；两者皆无时放行。
+// 配置后每条入向 Hello 都须经 handler 判定。
+func WithAuthHandler(h AuthHandler) Option {
+	return aggOption(func(o *options) { o.authHandler = h })
 }
 
 // Aggregator 是聚合库的公开入口：OpenStream 主动发起聚合流，
@@ -303,8 +345,11 @@ func (a *Aggregator) handlePathStream(s network.Stream) {
 	a.streamsMu.Lock()
 	st := a.streams[aggID]
 	a.streamsMu.Unlock()
-	if st == nil {
-		fail() // 不认识的 agg_stream_id
+	if st == nil || s.Conn().RemotePeer() != st.Peer() {
+		// 不认识的 agg_stream_id，或绑定子流并非来自该聚合流的
+		// 对端（防第三方凭泄漏的 id 挂路径；电路路径同样适用——
+		// circuit v2 连接端到端认证，RemotePeer 即真实对端）。
+		fail()
 		return
 	}
 	// 预定 path_id：分侧命名空间 + 不重复（死路径重加须换新 id）
@@ -400,6 +445,7 @@ func (a *Aggregator) defaultOpenOptions() openOptions {
 		reorderMin:       a.opts.reorderMin,
 		reorderMax:       a.opts.reorderMax,
 		policy:           a.opts.policy,
+		authToken:        a.opts.authToken,
 	}
 }
 
@@ -441,7 +487,7 @@ func (a *Aggregator) OpenStream(ctx context.Context, p peer.ID, opts ...OpenOpti
 	stop := watchStreamCtx(s, hsCtx)
 	defer stop()
 
-	id, err := handshakeInitiator(s)
+	id, err := handshakeInitiator(s, oo.authToken)
 	if err != nil {
 		_ = s.Reset()
 		return nil, fmt.Errorf("netacc: %w: %w", ErrHandshake, err)
@@ -519,12 +565,21 @@ func (a *Aggregator) Accept(ctx context.Context) (*Stream, error) {
 			a.host.ConnManager().Protect(s.Conn().RemotePeer(), connmgrTag)
 			hsCtx, cancel := a.handshakeCtx(ctx)
 			stop := watchStreamCtx(s, hsCtx)
-			id, err := handshakeResponderRead(s)
+			id, auth, err := handshakeResponderRead(s)
 			if err != nil {
 				stop()
 				cancel()
 				_ = s.Reset()
 				continue // 坏握手不影响后续入流
+			}
+			if aerr := a.checkAuth(s.Conn().RemotePeer(), auth); aerr != nil {
+				// 鉴权拒绝：回 HelloAck{error} 让对端拿到原因。
+				// 用 Close 而非 Reset——优雅关闭保证错误应答送达。
+				_ = handshakeResponderReject(s, id, aerr.Error())
+				stop()
+				cancel()
+				_ = s.Close()
+				continue
 			}
 			st := newStreamFull(id, s, a.streamCfg(a.defaultOpenOptions()), a, s.Conn().RemotePeer(), false)
 			// 注册先于回执：HelloAck 到达对端后，对端的 PATH_ATTACH
@@ -548,6 +603,24 @@ func (a *Aggregator) Accept(ctx context.Context) (*Stream, error) {
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// errAuthRejected 是默认 token 校验失败时经 HelloAck.error 回传的
+// 拒绝原因。wire 上用固定 ASCII 词（与 tunnelwire abort 原因同风格），
+// 便于跨实现（Go/JS）匹配。
+var errAuthRejected = errors.New("unauthorized")
+
+// checkAuth 是入向握手的鉴权判定：配了 WithAuthHandler 全权交给
+// handler；未配 handler 但构造默认带 authToken 时退化为「auth 与
+// token 常数时间相等」；两者皆无 → 放行（默认不鉴权）。
+func (a *Aggregator) checkAuth(p peer.ID, auth []byte) error {
+	if a.opts.authHandler != nil {
+		return a.opts.authHandler(p, auth)
+	}
+	if len(a.opts.authToken) > 0 && subtle.ConstantTimeCompare(auth, a.opts.authToken) != 1 {
+		return errAuthRejected
+	}
+	return nil
 }
 
 // handshakeCtx 为握手阶段派生 ctx：调用方已带 deadline 时原样返回，

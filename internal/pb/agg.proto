@@ -12,6 +12,10 @@ message Hello {
   // agg_stream_id：发起方生成的 128bit 随机聚合流标识。
   // 后续所有数据路径的 PATH_ATTACH 凭此 ID 绑定到同一条聚合流。
   bytes agg_stream_id = 1;
+  // auth：可选鉴权凭证（与接收方约定的共享密钥）。
+  // 接收方配置了鉴权（WithAuthHandler/WithAuthToken）时按配置校验；
+  // 未开鉴权时忽略本字段。
+  bytes auth = 2;
 }
 
 // HelloAck 是接收方对 Hello 的应答：回显 agg_stream_id 即表示接受。
@@ -19,6 +23,9 @@ message Hello {
 // 规格书 §4.1）。
 message HelloAck {
   bytes agg_stream_id = 1;
+  // error：非空表示接收方拒绝（如鉴权失败 "unauthorized"），
+  // 此时 agg_stream_id 不代表协商成功。
+  string error = 2;
 }
 
 // PathAttach 是 PATH_ATTACH 帧（帧类型 3）的 protobuf 帧体。
